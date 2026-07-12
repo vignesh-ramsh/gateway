@@ -1,0 +1,32 @@
+[project]
+name = "gateway"
+version = "0.1.0"
+description = "ARC provider plugin: HTTP/WS transport (routing, middleware, OpenAPI)"
+requires-python = ">=3.12"
+dependencies = [
+    "granian>=1.0",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+# msgspec deliberately NOT listed here anymore — gateway used to call it
+# directly (request.py/openapi.py), now goes through arc.codec instead, so
+# it only needs whatever the kernel already depends on transitively.
+
+[project.entry-points."arc.plugins"]
+gateway = "gateway:register"
+
+[project.entry-points."arc.plugins.cli"]
+gateway = "gateway.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "httpx>=0.27"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gateway"]

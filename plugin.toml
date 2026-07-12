@@ -1,0 +1,6 @@
+[plugin]
+name = "gateway"
+version = "0.1.0"
+capability = "gateway"
+requires = []
+optional_requires = ["authn"]
