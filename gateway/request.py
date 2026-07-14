@@ -54,24 +54,51 @@ class Request:
     scope: dict  # raw ASGI scope, for advanced/edge-case access
     validated: Any = None  # set when the matched route declared a request_schema
     identity: Any = None  # set by the identity-resolution middleware, if authn is present
+    client_ip: str | None = None  # set by client_ip_middleware — proxy-aware if
+                                   # trusted_proxies is configured, raw scope["client"]
+                                   # otherwise
 
     def json(self, schema: Any | None = None) -> Any:
         if schema is not None:
             return arc.codec.decode(self.body, type=schema)
         return arc.codec.decode(self.body)
 
+    def form(self) -> Any:
+        """Parses `self.body` as multipart/form-data using this request's own
+        Content-Type header (for the boundary). Lazy import to avoid a
+        request.py <-> multipart.py circular import at module load time —
+        multipart.py itself imports HTTPError from here."""
+        from .multipart import parse_multipart_form
+
+        return parse_multipart_form(self.body, self.headers.get("content-type", ""))
+
     def query(self, name: str, default: str | None = None) -> str | None:
         values = self.query_params.get(name)
         return values[0] if values else default
 
 
-async def read_body(receive) -> bytes:
+async def read_body(receive, *, max_bytes: int | None = None) -> bytes:
+    """max_bytes=None means unbounded (today's original behavior) — callers
+    that care about a size ceiling (gateway._dispatch, wired to the
+    gateway_max_body_bytes setting) pass one explicitly. Once exceeded, stops
+    ACCUMULATING further chunks (bounding memory) but keeps DRAINING the ASGI
+    receive channel until more_body is False, so the connection is closed
+    cleanly rather than left hanging with unread body still incoming."""
     chunks = []
+    total = 0
+    exceeded = False
     while True:
         message = await receive()
-        chunks.append(message.get("body", b""))
+        chunk = message.get("body", b"")
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            exceeded = True
+        else:
+            chunks.append(chunk)
         if not message.get("more_body", False):
             break
+    if exceeded:
+        raise HTTPError(413, {"error": "payload too large", "limit_bytes": max_bytes})
     return b"".join(chunks)
 
 
@@ -121,7 +148,21 @@ async def send_json(
     extra_headers: dict[str, str] | None = None,
 ) -> None:
     body = encode_json(content)
-    headers = [(b"content-type", b"application/json")]
+    await send_bytes(send, status_code, body, content_type="application/json", extra_headers=extra_headers)
+
+
+async def send_bytes(
+    send,
+    status_code: int,
+    body: bytes,
+    *,
+    content_type: str = "application/octet-stream",
+    extra_headers: dict[str, str] | None = None,
+) -> None:
+    """The non-JSON counterpart to send_json — used for SPA-mount static
+    file serving (gateway/__init__.py's _try_serve_spa), where the
+    content-type is derived from the file itself, never hardcoded."""
+    headers = [(b"content-type", content_type.encode("latin-1"))]
     for k, v in (extra_headers or {}).items():
         headers.append((k.encode("latin-1"), v.encode("latin-1")))
     await send(

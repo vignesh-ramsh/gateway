@@ -134,6 +134,13 @@ class Router:
             return MatchResult(None, params, frozenset(node.routes))
         return MatchResult(None)
 
+    def first_segment_registered(self, segment: str) -> bool:
+        """Whether any route's first path segment is exactly this literal
+        segment — used by GatewayProvider to guard an SPA mount prefix
+        (gateway/__init__.py's mount_spa) against colliding with an
+        existing JSON route, and vice versa."""
+        return segment in self._root.static
+
     def all_routes(self) -> list[RouteEntry]:
         """Every registered route, for OpenAPI generation and `arc gateway routes`."""
         out: list[RouteEntry] = []
