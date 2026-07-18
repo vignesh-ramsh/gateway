@@ -10,7 +10,9 @@ from __future__ import annotations
 import importlib
 import os
 import shutil
+import sys
 import warnings
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -21,6 +23,21 @@ from arc.runtime import find_project_root
 app = typer.Typer(help="Commands for the gateway provider.")
 console = Console()
 err_console = Console(stderr=True, style="bold red")
+
+
+def _resolve_sibling_executable(name: str) -> str | None:
+    """Prefer the executable living alongside the CURRENT Python
+    interpreter (sys.executable) — the same venv's own bin/ — over a bare
+    PATH lookup. Matters under a minimal-PATH invoker like systemd, which
+    never sources a shell profile or venv activation: shutil.which(name)
+    alone can come back empty even though `name` sits right next to
+    python3/arc themselves, simply because the venv's bin/ was never added
+    to PATH. Falls back to shutil.which() for an unusual install layout
+    where that assumption doesn't hold."""
+    candidate = Path(sys.executable).parent / name
+    if candidate.is_file():
+        return str(candidate)
+    return shutil.which(name)
 
 
 @app.command()
@@ -45,22 +62,27 @@ def serve(
     if root is None:
         err_console.print("Not inside an ARC project (no .arc/arc.toml found here or in any parent).")
         raise typer.Exit(code=1)
-    if shutil.which("granian") is None:
+    granian_bin = _resolve_sibling_executable("granian")
+    if granian_bin is None:
         err_console.print(
-            "`granian` was not found on PATH. It should already be a dependency "
-            "of the gateway plugin — check `uv sync --all-packages` ran cleanly."
+            "`granian` was not found next to this Python interpreter or on PATH. It "
+            "should already be a dependency of the gateway plugin — check "
+            "`uv sync --all-packages` ran cleanly."
         )
         raise typer.Exit(code=1)
 
     argv = [
-        "granian", "--interface", "asgi", target,
+        granian_bin, "--interface", "asgi", target,
         "--host", host, "--port", str(port), "--workers", str(workers),
     ]
     if reload:
         argv.append("--reload")
 
     console.print(f"[dim]$ {' '.join(argv)}[/dim]")
-    os.execvp("granian", argv)  # replace this process — real signal handling for a foreground server
+    # execvp: a candidate containing "/" (the resolved sibling path always
+    # does) is used directly, no PATH search — correct either way this
+    # resolved, PATH-dependent or not.
+    os.execvp(granian_bin, argv)  # replace this process — real signal handling for a foreground server
 
 
 @app.command()
