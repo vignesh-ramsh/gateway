@@ -5,19 +5,25 @@ Standard ASGI middleware convention throughout: `middleware(app) -> app`,
 where `app(scope, receive, send)` is awaitable. Composed in a fixed order
 (see gateway/__init__.py): security headers -> CORS -> CSRF -> client_ip -> identity.
 
-The identity-resolution slot (§3.3) is the important one: it is only wired
-into the pipeline at all if `kernel.has("authn")` at register() time — no
-dummy anonymous-user object, no special-casing. Since no real `authn` plugin
-exists yet, the slot's contract is duck-typed and documented here so a
-future authn plugin has a concrete target: an object exporting
-`async def resolve_identity(request) -> Any | None`.
+The identity-resolution slot (§3.3/§3.13) is unconditional — composed into
+the pipeline always, resolving `kernel.get("authn")` lazily PER REQUEST
+(see identity_middleware's own docstring for the boot-order bug the old
+"only wired if kernel.has('authn') at register() time" design turned out
+to be). The slot's contract, implemented for real by the authn plugin: an
+object exporting `async def resolve_identity(scope) -> Any | None` — no
+authn installed, or no valid credentials, both resolve to None; no dummy
+anonymous-user object anywhere.
 """
 
 from __future__ import annotations
 
+import hmac
+import logging
 from typing import Any, Awaitable, Callable
 
 from .request import get_header
+
+_logger = logging.getLogger("gateway")
 
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 Middleware = Callable[[ASGIApp], ASGIApp]
@@ -122,7 +128,7 @@ def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> M
             )
             token_cookie = cookies.get(b"csrf_token")
 
-            if not token_header or not token_cookie or token_header != token_cookie:
+            if not token_header or not token_cookie or not hmac.compare_digest(token_header, token_cookie):
                 await send(
                     {
                         "type": "http.response.start",
@@ -215,7 +221,20 @@ def identity_middleware(kernel: Any) -> Middleware:
                 return await app(scope, receive, send)
             authn_provider = kernel.get("authn") if kernel.has("authn") else None
             resolve = getattr(authn_provider, "resolve_identity", None)
-            identity = await resolve(scope) if callable(resolve) else None
+            try:
+                identity = await resolve(scope) if callable(resolve) else None
+            except Exception:
+                # resolve_identity's contract is "None, never raise" for
+                # AUTH failures — but an infrastructure failure inside it
+                # (Redis down, DB pool exhausted) used to escape here, past
+                # gateway's dispatcher catch-all (middleware runs outside
+                # it), straight to Granian as an unstructured 500 on every
+                # credentialed request. Failing closed to None (401/403
+                # downstream) with a server-side traceback is the correct
+                # degradation; authn's own cache layer additionally degrades
+                # cache errors to DB reads so this branch is a last resort.
+                _logger.exception("identity resolution raised — treating request as unauthenticated")
+                identity = None
             scope = {**scope, "state": {**scope.get("state", {}), "arc_identity": identity}}
             await app(scope, receive, send)
 

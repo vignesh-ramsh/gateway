@@ -76,6 +76,8 @@ class GatewayProvider:
         self._kernel = kernel
         self._router = Router()
         self._spa_mounts: dict[str, Path] = {}
+        # path -> (mtime_ns, bytes, content_type); see _try_serve_spa.
+        self._spa_file_cache: dict[str, tuple[int, bytes, str]] = {}
         self._extra_middlewares: list[Callable[[ASGIApp], ASGIApp]] = []
         self._built_app: ASGIApp | None = None
         self._trusted_proxies = trusted_proxies or []
@@ -229,8 +231,11 @@ class GatewayProvider:
         if method == "GET" and self._spa_mounts:
             spa_hit = await self._try_serve_spa(path)
             if spa_hit is not None:
-                body, content_type = spa_hit
-                await send_bytes(send, 200, body, content_type=content_type)
+                body, content_type, cache_control = spa_hit
+                await send_bytes(
+                    send, 200, body, content_type=content_type,
+                    extra_headers={"Cache-Control": cache_control},
+                )
                 return
 
         match = self._router.match(method, path)
@@ -292,11 +297,12 @@ class GatewayProvider:
         else:
             await send_json(send, 200, result)
 
-    async def _try_serve_spa(self, path: str) -> tuple[bytes, str] | None:
-        """Returns (body, content_type) if `path` falls under a mounted SPA
-        prefix, else None (falls through to ordinary routing/404). GET-only,
-        by the caller above — HEAD isn't worth the "no body on a HEAD
-        response" nuance for serving a handful of static SPA assets.
+    async def _try_serve_spa(self, path: str) -> tuple[bytes, str, str] | None:
+        """Returns (body, content_type, cache_control) if `path` falls under
+        a mounted SPA prefix, else None (falls through to ordinary
+        routing/404). GET-only, by the caller above — HEAD isn't worth the
+        "no body on a HEAD response" nuance for serving a handful of static
+        SPA assets.
 
         Path-traversal guard: the resolved file must still live inside the
         mount's dist_dir — a `..`-laden path (however it got there) can
@@ -304,7 +310,15 @@ class GatewayProvider:
         (traversal attempt, directory, or a client-side SPA route with no
         matching asset) falls back to the mount's own index.html — the
         standard SPA-hosting behavior, and safe either way: it only ever
-        serves a file already inside the mount, never anything else."""
+        serves a file already inside the mount, never anything else.
+
+        Caching: bytes are held in a small in-memory cache keyed by
+        (path, mtime_ns) — a Vite build's hashed assets are immutable, and
+        re-reading them from disk per request was pure cost. index.html
+        gets `no-cache` (the entry point must always revalidate so a new
+        deploy is picked up); everything else — hashed filenames — gets a
+        long immutable lifetime, so the browser stops re-requesting
+        entirely."""
         segments = [s for s in path.strip("/").split("/") if s]
         if not segments or segments[0] not in self._spa_mounts:
             return None
@@ -319,26 +333,48 @@ class GatewayProvider:
             if not resolved.is_file():
                 return None
 
-        content_type, _ = mimetypes.guess_type(str(resolved))
-        body = await asyncio.to_thread(resolved.read_bytes)
-        return body, content_type or "application/octet-stream"
+        is_index = resolved.name == "index.html"
+        cache_control = "no-cache" if is_index else "public, max-age=31536000, immutable"
+
+        mtime_ns = resolved.stat().st_mtime_ns
+        cache_key = str(resolved)
+        cached = self._spa_file_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            body, content_type = cached[1], cached[2]
+        else:
+            content_type, _ = mimetypes.guess_type(str(resolved))
+            content_type = content_type or "application/octet-stream"
+            body = await asyncio.to_thread(resolved.read_bytes)
+            self._spa_file_cache[cache_key] = (mtime_ns, body, content_type)
+        return body, content_type, cache_control
 
     # ------------------------------------------------------------------ #
     # ASGI lifespan — the generic startup/shutdown hook every capability
     # with open()/close() benefits from automatically.
     # ------------------------------------------------------------------ #
     async def _handle_lifespan(self, receive: Callable, send: Callable) -> None:
+        import arc as _arc  # gateway has no module-level arc import; events is a kernel service module
+
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
                 try:
                     await self._open_all_capabilities()
+                    # This worker is a long-running ARC process: register it
+                    # in .arc/runtime/processes (what `arc ps` lists and
+                    # `arc reload` signals) and start the SIGUSR1 +
+                    # reload-stamp bridge that turns cross-process
+                    # notifications into a local system.reload event
+                    # (arc.events' own docstring). AFTER open_all — the
+                    # stamp poll reads through psqldb's pool.
+                    _arc.events.install_process_bridge(role="gateway-worker")
                 except Exception as exc:
                     await send({"type": "lifespan.startup.failed", "message": str(exc)})
                     return
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 try:
+                    await _arc.events.uninstall_process_bridge()
                     await self._close_all_capabilities()
                     await send({"type": "lifespan.shutdown.complete"})
                 except Exception as exc:
