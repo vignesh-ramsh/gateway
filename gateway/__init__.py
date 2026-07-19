@@ -37,11 +37,14 @@ from .request import (
     HTTPError,
     Request,
     Response,
+    StreamResponse,
+    encode_json,
     headers_from_scope,
     query_params_from_scope,
     read_body,
     send_bytes,
     send_json,
+    send_stream,
 )
 from .router import Router, RouterError
 
@@ -290,6 +293,28 @@ class GatewayProvider:
             # the exception potentially reaching the response.
             _logger.exception("unhandled exception in %s %s", method, path)
             await send_json(send, 500, {"error": "internal server error"})
+            return
+
+        if isinstance(result, StreamResponse):
+            try:
+                await send_stream(send, result)
+            except Exception:
+                # http.response.start (status 200) is already sent by this
+                # point — there is no way to change status code mid-stream,
+                # so the best this can do is log server-side (same as the
+                # catch-all below) and try to end the body with one visible
+                # error chunk rather than just going silent; a client
+                # reading the stream sees a truncated/errored feed either
+                # way, which is itself the signal something went wrong.
+                _logger.exception("unhandled exception while streaming %s %s", method, path)
+                try:
+                    await send({
+                        "type": "http.response.body",
+                        "body": encode_json({"error": "internal server error"}) + b"\n",
+                        "more_body": False,
+                    })
+                except Exception:
+                    pass
             return
 
         if isinstance(result, Response):

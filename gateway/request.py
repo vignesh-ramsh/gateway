@@ -44,6 +44,42 @@ class Response:
 
 
 @dataclass
+class StreamResponse:
+    """Return one of these (or let arc.relay.stream()'s own wiring hand one
+    back for you, see relay/__init__.py's _wire_gateway_route) to keep the
+    connection open and send pieces as they're produced, instead of
+    buffering the whole response first. `source` is any async iterator of
+    JSON-encodable chunks — each one is arc.codec-encoded and sent as one
+    newline-delimited JSON line (`application/x-ndjson`), chosen over SSE's
+    `text/event-stream` since this isn't tied to GET/EventSource — a POST
+    that runs a long action and reports its own progress on the same
+    connection is the primary use case, not just GET-triggered live feeds."""
+
+    source: Any
+    status_code: int = 200
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+async def send_stream(send, response: "StreamResponse") -> None:
+    """Sends `http.response.start` once, then one `http.response.body`
+    message per item `response.source` yields (more_body=True throughout),
+    then a final empty one (more_body=False) to close the response. Once
+    the first message is sent, the status code can never change — an
+    exception raised partway through `source` can't become a different
+    HTTP status the way a normal handler's exception can; the caller
+    (gateway._dispatch) is expected to log it and let the stream simply end
+    (a truncated stream is itself the client-visible signal something went
+    wrong, the same way a truncated file download is)."""
+    headers = [(b"content-type", b"application/x-ndjson")]
+    for k, v in (response.headers or {}).items():
+        headers.append((k.encode("latin-1"), v.encode("latin-1")))
+    await send({"type": "http.response.start", "status": response.status_code, "headers": headers})
+    async for chunk in response.source:
+        await send({"type": "http.response.body", "body": encode_json(chunk) + b"\n", "more_body": True})
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+@dataclass
 class Request:
     method: str
     path: str
