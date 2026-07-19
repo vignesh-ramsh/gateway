@@ -393,6 +393,7 @@ class GatewayProvider:
                     # (arc.events' own docstring). AFTER open_all — the
                     # stamp poll reads through psqldb's pool.
                     _arc.events.install_process_bridge(role="gateway-worker")
+                    _arc.log.set_role("gateway-worker")
                 except Exception as exc:
                     await send({"type": "lifespan.startup.failed", "message": str(exc)})
                     return
