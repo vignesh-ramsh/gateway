@@ -36,6 +36,19 @@ class RouteEntry:
     request_schema: Any | None = None
     response_schema: Any | None = None
     summary: str | None = None
+    # None (the default) means "use the gateway-wide gateway_max_body_bytes
+    # ceiling" — the same boot-time-only, restart-to-change posture that
+    # global setting already has (gateway/__init__.py reads it once at
+    # construction). A route that sets this (e.g. filer's file_upload)
+    # gets its OWN outer ASGI-level ceiling instead — deliberately still a
+    # fixed, boot-time value, not tied to any live-editable setting: this
+    # is "how big can the wire request even be", not a business rule (the
+    # business rule — how big a file filer actually accepts — stays a
+    # live setting, checked after the body's already been read, in
+    # arc.filer.upload() itself). Lets one route (large file uploads)
+    # accept a much bigger body than every other endpoint without raising
+    # the shared global ceiling that bounds ordinary JSON payloads too.
+    max_body_bytes: int | None = None
 
 
 @dataclass
@@ -81,6 +94,7 @@ class Router:
         request_schema: Any | None = None,
         response_schema: Any | None = None,
         summary: str | None = None,
+        max_body_bytes: int | None = None,
     ) -> None:
         method = method.upper()
         node = self._root
@@ -112,6 +126,7 @@ class Router:
             request_schema=request_schema,
             response_schema=response_schema,
             summary=summary,
+            max_body_bytes=max_body_bytes,
         )
 
     def match(self, method: str, path: str) -> MatchResult:

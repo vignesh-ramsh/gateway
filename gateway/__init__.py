@@ -38,6 +38,7 @@ from .request import (
     Request,
     Response,
     StreamResponse,
+    cookies_from_scope,
     encode_json,
     headers_from_scope,
     query_params_from_scope,
@@ -138,9 +139,17 @@ class GatewayProvider:
         request_schema: Any | None = None,
         response_schema: Any | None = None,
         summary: str | None = None,
+        max_body_bytes: int | None = None,
     ) -> None:
         """Register a route. Relay (Phase 3) will call this the same way any
-        other caller does — Gateway never hardcodes knowledge of Resources."""
+        other caller does — Gateway never hardcodes knowledge of Resources.
+
+        `max_body_bytes`: None (default) means this route is bounded by the
+        gateway-wide `gateway_max_body_bytes` ceiling like everything else;
+        pass a value to give ONE route its own larger (or smaller) outer
+        ASGI-level body limit — e.g. a file-upload endpoint that needs to
+        accept much bigger requests than an ordinary JSON API call, without
+        raising the shared ceiling every other endpoint is also bounded by."""
         first_segment = next((s for s in path.strip("/").split("/") if s), None)
         if first_segment is not None and first_segment in self._spa_mounts:
             raise RouterError(
@@ -150,6 +159,7 @@ class GatewayProvider:
         self._router.add_route(
             method, path, handler,
             request_schema=request_schema, response_schema=response_schema, summary=summary,
+            max_body_bytes=max_body_bytes,
         )
         self._built_app = None
 
@@ -256,7 +266,7 @@ class GatewayProvider:
 
         route = match.route
         try:
-            body = await read_body(receive, max_bytes=self._max_body_bytes)
+            body = await read_body(receive, max_bytes=route.max_body_bytes or self._max_body_bytes)
         except HTTPError as exc:
             await send_json(send, exc.status_code, exc.detail)
             return
@@ -271,6 +281,7 @@ class GatewayProvider:
             scope=scope,
             identity=scope.get("state", {}).get("arc_identity"),
             client_ip=scope.get("state", {}).get("arc_client_ip"),
+            cookies=cookies_from_scope(scope),
         )
 
         if route.request_schema is not None:
@@ -318,7 +329,14 @@ class GatewayProvider:
             return
 
         if isinstance(result, Response):
-            await send_json(send, result.status_code, result.content, extra_headers=result.headers)
+            if result.media_type == "application/json":
+                await send_json(send, result.status_code, result.content, extra_headers=result.headers, cookies=result.cookies)
+            else:
+                body = result.content if isinstance(result.content, bytes) else str(result.content).encode("utf-8")
+                await send_bytes(
+                    send, result.status_code, body,
+                    content_type=result.media_type, extra_headers=result.headers, cookies=result.cookies,
+                )
         else:
             await send_json(send, 200, result)
 

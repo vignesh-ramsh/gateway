@@ -21,7 +21,7 @@ import hmac
 import logging
 from typing import Any, Awaitable, Callable
 
-from .request import get_header
+from .request import cookies_from_scope, get_header
 
 _logger = logging.getLogger("gateway")
 
@@ -32,7 +32,21 @@ Middleware = Callable[[ASGIApp], ASGIApp]
 def security_headers_middleware(*, hsts: bool = False) -> Middleware:
     """Baseline headers on every response. HSTS only if the app is confident
     it's served over TLS (`gateway_force_https` setting) — sending it over
-    plain HTTP is actively harmful (it forces HTTPS on future visits)."""
+    plain HTTP is actively harmful (it forces HTTPS on future visits).
+
+    `X-Frame-Options: DENY` is the default, but only ever ADDED — never
+    appended on top of one the handler already set. Without that check, a
+    handler returning its own `X-Frame-Options` (e.g. filer's serve_file,
+    which sets SAMEORIGIN so a PDF can render in this app's own preview
+    `<iframe>`) would end up with BOTH values on the wire; browsers treat
+    duplicate X-Frame-Options headers as the most restrictive one wins,
+    so the handler's own choice would be silently overridden by DENY no
+    matter what it asked for — confirmed directly against a real PDF
+    upload: the file served fine (200, correct bytes, correct
+    content-type) but never rendered in the preview iframe, purely
+    because of this unconditional append. Same reasoning would apply to
+    x-content-type-options, but nosniff has no legitimate reason for any
+    route to ever want it disabled, so that one stays unconditional."""
 
     def middleware(app: ASGIApp) -> ASGIApp:
         async def wrapped(scope, receive, send):
@@ -43,7 +57,8 @@ def security_headers_middleware(*, hsts: bool = False) -> Middleware:
                 if message["type"] == "http.response.start":
                     headers = list(message.get("headers", []))
                     headers.append((b"x-content-type-options", b"nosniff"))
-                    headers.append((b"x-frame-options", b"DENY"))
+                    if not any(k.lower() == b"x-frame-options" for k, _ in headers):
+                        headers.append((b"x-frame-options", b"DENY"))
                     if hsts:
                         headers.append(
                             (b"strict-transport-security", b"max-age=63072000; includeSubDomains")
@@ -112,8 +127,19 @@ def cors_middleware(allowed_origins: list[str] | None) -> Middleware:
 def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> Middleware:
     """Opt-in (default off) — matters for cookie-session auth, not bearer
     tokens, so most API-only deployments never need it on. When enabled,
-    unsafe methods must carry a `X-CSRF-Token` header matching a
-    `csrf_token` cookie (the standard double-submit-cookie pattern)."""
+    unsafe methods carrying an `arc_session` cookie must also carry a
+    `X-CSRF-Token` header matching a `csrf_token` cookie (the standard
+    double-submit-cookie pattern).
+
+    Deliberately scoped to requests that already carry a session cookie —
+    NOT every unsafe method. /login has no session cookie yet (that's the
+    whole point of it), so gating on "unsafe method" alone made login
+    itself permanently unreachable: a cookie that can only be minted by a
+    successful login can't also be a prerequisite for calling it. A
+    request with no arc_session cookie is either a pre-session endpoint
+    (login/forgot-password/reset-password) or authenticated via
+    X-API-Key, and CSRF (a forged *browser* request riding an existing
+    session cookie) isn't a meaningful threat against either."""
     unsafe_methods = {"POST", "PUT", "PATCH", "DELETE"}
 
     def middleware(app: ASGIApp) -> ASGIApp:
@@ -121,14 +147,16 @@ def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> M
             if not enabled or scope["type"] != "http" or scope["method"] not in unsafe_methods:
                 return await app(scope, receive, send)
 
-            token_header = get_header(scope, header_name)
-            cookie_header = get_header(scope, b"cookie") or b""
-            cookies = dict(
-                pair.split(b"=", 1) for pair in cookie_header.split(b"; ") if b"=" in pair
-            )
-            token_cookie = cookies.get(b"csrf_token")
+            cookies = cookies_from_scope(scope)
+            if "arc_session" not in cookies:
+                return await app(scope, receive, send)
 
-            if not token_header or not token_cookie or not hmac.compare_digest(token_header, token_cookie):
+            token_header = get_header(scope, header_name)
+            token_cookie = cookies.get("csrf_token")
+
+            if not token_header or not token_cookie or not hmac.compare_digest(
+                token_header.decode("latin-1"), token_cookie
+            ):
                 await send(
                     {
                         "type": "http.response.start",
