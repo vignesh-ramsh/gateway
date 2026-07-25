@@ -1,6 +1,12 @@
 """
 gateway — ARC provider plugin: HTTP/WS transport (Architecture §2).
 
+TODO(WS): "WS" above is aspirational — there is no WebSocket routing
+surface yet (no `add_ws_route`, no ASGI websocket-scope handling).
+Streaming today goes through `relay.stream()` / `StreamResponse` instead.
+Either build real WS routing or drop "WS" from this docstring — see
+Improvement Doc §4 issue 4 / §4 P2.
+
 Exports `arc.gateway`: routing (add_route), middleware (add_middleware),
 OpenAPI generation, and the ASGI 3.0 entrypoint an ASGI server (Granian)
 actually serves. Deliberately transport-only — no authorization, no
