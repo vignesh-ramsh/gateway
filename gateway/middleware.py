@@ -3,7 +3,8 @@ gateway.middleware
 -------------------
 Standard ASGI middleware convention throughout: `middleware(app) -> app`,
 where `app(scope, receive, send)` is awaitable. Composed in a fixed order
-(see gateway/__init__.py): security headers -> CORS -> CSRF -> client_ip -> identity.
+(see gateway/__init__.py): security headers -> CORS -> CSRF -> client_ip ->
+identity -> access_log.
 
 The identity-resolution slot (§3.3/§3.13) is unconditional — composed into
 the pipeline always, resolving `kernel.get("authn")` lazily PER REQUEST
@@ -13,12 +14,17 @@ to be). The slot's contract, implemented for real by the authn plugin: an
 object exporting `async def resolve_identity(scope) -> Any | None` — no
 authn installed, or no valid credentials, both resolve to None; no dummy
 anonymous-user object anywhere.
+
+access_log_middleware is innermost deliberately — it reads
+scope["state"]["arc_client_ip"]/["arc_identity"], both only populated by
+the two middlewares ahead of it in the chain.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from .request import cookies_from_scope, get_header
@@ -27,6 +33,37 @@ _logger = logging.getLogger("gateway")
 
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 Middleware = Callable[[ASGIApp], ASGIApp]
+
+
+class RequestMetrics:
+    """Per-process, in-memory request counters — the same "this process's
+    own self-report" posture as psqldb's pool_stats()/arc.events.stats():
+    no cross-process aggregation, resets on restart, read through
+    GatewayProvider.health() (arc.health.check() picks it up from there
+    for free). Gateway is the only thing that ever sees every request, so
+    the counting has to happen here regardless of what, if anything, ever
+    reads it downstream — a future telemetry/observability layer would be
+    a CONSUMER of these numbers via health(), not a reason to move the
+    counting itself somewhere else."""
+
+    def __init__(self) -> None:
+        self._total = 0
+        self._by_status_class: dict[str, int] = {}
+        self._total_duration_ms = 0.0
+
+    def record(self, status: int, duration_ms: float) -> None:
+        self._total += 1
+        bucket = f"{status // 100}xx" if status else "unknown"
+        self._by_status_class[bucket] = self._by_status_class.get(bucket, 0) + 1
+        self._total_duration_ms += duration_ms
+
+    def snapshot(self) -> dict[str, Any]:
+        avg = self._total_duration_ms / self._total if self._total else 0.0
+        return {
+            "total": self._total,
+            "by_status_class": dict(self._by_status_class),
+            "avg_duration_ms": round(avg, 1),
+        }
 
 
 def security_headers_middleware(*, hsts: bool = False) -> Middleware:
@@ -101,7 +138,9 @@ def cors_middleware(allowed_origins: list[str] | None) -> Middleware:
                 headers = []
                 if allow:
                     headers.append((b"access-control-allow-origin", allow_origin_value))
-                    headers.append((b"access-control-allow-methods", b"GET, POST, PUT, PATCH, DELETE, OPTIONS"))
+                    headers.append(
+                        (b"access-control-allow-methods", b"GET, POST, PUT, PATCH, DELETE, OPTIONS")
+                    )
                     req_headers = get_header(scope, b"access-control-request-headers")
                     if req_headers:
                         headers.append((b"access-control-allow-headers", req_headers))
@@ -154,8 +193,10 @@ def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> M
             token_header = get_header(scope, header_name)
             token_cookie = cookies.get("csrf_token")
 
-            if not token_header or not token_cookie or not hmac.compare_digest(
-                token_header.decode("latin-1"), token_cookie
+            if (
+                not token_header
+                or not token_cookie
+                or not hmac.compare_digest(token_header.decode("latin-1"), token_cookie)
             ):
                 await send(
                     {
@@ -165,7 +206,10 @@ def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> M
                     }
                 )
                 await send(
-                    {"type": "http.response.body", "body": b'{"error": "CSRF token missing or invalid"}'}
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"error": "CSRF token missing or invalid"}',
+                    }
                 )
                 return
 
@@ -176,7 +220,9 @@ def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> M
     return middleware
 
 
-def client_ip_middleware(*, trusted_proxies: list[str] | None, forwarded_header: bytes) -> Middleware:
+def client_ip_middleware(
+    *, trusted_proxies: list[str] | None, forwarded_header: bytes
+) -> Middleware:
     """Always active, unlike CORS/CSRF/identity — there's no meaningful
     "off" state, only "no proxies configured" (the default), which just
     means trust nothing and use the raw ASGI peer address. Must run BEFORE
@@ -261,10 +307,68 @@ def identity_middleware(kernel: Any) -> Middleware:
                 # downstream) with a server-side traceback is the correct
                 # degradation; authn's own cache layer additionally degrades
                 # cache errors to DB reads so this branch is a last resort.
-                _logger.exception("identity resolution raised — treating request as unauthenticated")
+                _logger.exception(
+                    "identity resolution raised — treating request as unauthenticated"
+                )
                 identity = None
             scope = {**scope, "state": {**scope.get("state", {}), "arc_identity": identity}}
             await app(scope, receive, send)
+
+        return wrapped
+
+    return middleware
+
+
+def access_log_middleware(metrics: RequestMetrics) -> Middleware:
+    """One structured JSON line per request via `logging.getLogger
+    ("gateway")` — arc.log already routes anything logged under that name
+    into logs/gateway.jsonl as real JSON, with any `extra={...}` kwarg
+    becoming real structured fields (see arc.log's own docstring); this
+    just has to actually call it, the infrastructure already exists.
+    Updates `metrics` at the same interception point — one wrapper serves
+    both jobs, no second pass over every request.
+
+    Innermost builtin middleware (see module docstring): reads
+    scope["state"]["arc_client_ip"]/["arc_identity"], both only populated
+    by client_ip_middleware/identity_middleware ahead of it in the chain.
+
+    Wrapped in try/finally, not a bare call — a request that raises all
+    the way through (a bug even gateway's own dispatcher catch-all didn't
+    catch) still gets logged and counted before the exception continues
+    propagating, rather than silently vanishing from both."""
+
+    def middleware(app: ASGIApp) -> ASGIApp:
+        async def wrapped(scope, receive, send):
+            if scope["type"] != "http":
+                return await app(scope, receive, send)
+
+            status_holder: dict[str, int] = {}
+
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start":
+                    status_holder["status"] = message["status"]
+                await send(message)
+
+            start = time.monotonic()
+            try:
+                await app(scope, receive, send_wrapper)
+            finally:
+                duration_ms = (time.monotonic() - start) * 1000
+                status = status_holder.get("status", 0)
+                state = scope.get("state", {})
+                identity = state.get("arc_identity")
+                _logger.info(
+                    "request",
+                    extra={
+                        "method": scope["method"],
+                        "path": scope["path"],
+                        "status": status,
+                        "duration_ms": round(duration_ms, 1),
+                        "client_ip": state.get("arc_client_ip"),
+                        "identity": getattr(identity, "email", None),
+                    },
+                )
+                metrics.record(status, duration_ms)
 
         return wrapped
 

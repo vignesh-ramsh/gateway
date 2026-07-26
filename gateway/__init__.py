@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .middleware import (
+    RequestMetrics,
+    access_log_middleware,
     client_ip_middleware,
     cors_middleware,
     csrf_middleware,
@@ -64,7 +66,7 @@ TRUSTED_PROXIES_KEY = "gateway_trusted_proxies"
 FORWARDED_HEADER_KEY = "gateway_forwarded_header"
 MAX_BODY_BYTES_KEY = "gateway_max_body_bytes"
 DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB — generous for a JSON API body,
-                                            # nowhere near "unbounded" (the bug this fixes)
+# nowhere near "unbounded" (the bug this fixes)
 
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 
@@ -93,16 +95,19 @@ class GatewayProvider:
         self._trusted_proxies = trusted_proxies or []
         self._forwarded_header = forwarded_header
         self._max_body_bytes = max_body_bytes
+        self._metrics = RequestMetrics()
 
-        # Fixed order: security headers -> CORS -> CSRF -> client_ip -> identity.
-        # Both client_ip and identity are unconditional now — identity_middleware
-        # looks up kernel.has("authn")/kernel.get("authn") lazily per request
-        # rather than once here at construction time (see its own docstring):
-        # authn optionally-requiring gateway doesn't guarantee gateway registers
-        # AFTER authn (arc's resolver only orders HARD requires strictly, §3.1) —
-        # `arc doctor` warns exactly this ordering can happen — so a boot-time
-        # kernel.has("authn") check here could easily see False even with authn
-        # fully installed, silently disabling identity resolution.
+        # Fixed order: security headers -> CORS -> CSRF -> client_ip -> identity
+        # -> access_log. Both client_ip and identity are unconditional now —
+        # identity_middleware looks up kernel.has("authn")/kernel.get("authn")
+        # lazily per request rather than once here at construction time (see
+        # its own docstring): authn optionally-requiring gateway doesn't
+        # guarantee gateway registers AFTER authn (arc's resolver only orders
+        # HARD requires strictly, §3.1) — `arc doctor` warns exactly this
+        # ordering can happen — so a boot-time kernel.has("authn") check here
+        # could easily see False even with authn fully installed, silently
+        # disabling identity resolution. access_log is innermost — it reads
+        # scope["state"] fields only client_ip/identity have populated by then.
         self._client_ip_mw_index = 3
         self._builtin_middlewares: list[Callable[[ASGIApp], ASGIApp]] = [
             security_headers_middleware(hsts=hsts),
@@ -110,6 +115,7 @@ class GatewayProvider:
             csrf_middleware(enabled=csrf_enabled),
             self._build_client_ip_middleware(),
             identity_middleware(kernel),
+            access_log_middleware(self._metrics),
         ]
 
         self._register_builtin_routes()
@@ -163,8 +169,12 @@ class GatewayProvider:
                 f"mounted as an SPA prefix"
             )
         self._router.add_route(
-            method, path, handler,
-            request_schema=request_schema, response_schema=response_schema, summary=summary,
+            method,
+            path,
+            handler,
+            request_schema=request_schema,
+            response_schema=response_schema,
+            summary=summary,
             max_body_bytes=max_body_bytes,
         )
         self._built_app = None
@@ -220,8 +230,17 @@ class GatewayProvider:
         too (it was arc.health's stand-in before arc.health existed); now
         that arc.health.check() is the one real aggregator, doing that here
         as well would nest a full copy of the whole system's health inside
-        gateway's own entry every time something calls arc.health.check()."""
-        return {"ok": True, "routes": len(self._router.all_routes())}
+        gateway's own entry every time something calls arc.health.check().
+
+        `requests` is this PROCESS's own counters since it started (see
+        RequestMetrics) — a multi-worker deployment has one independent
+        set per worker, same posture as psqldb's pool_stats() and
+        arc.events.stats(); no cross-process aggregation happens here."""
+        return {
+            "ok": True,
+            "routes": len(self._router.all_routes()),
+            "requests": self._metrics.snapshot(),
+        }
 
     # ------------------------------------------------------------------ #
     # ASGI 3.0 entrypoint
@@ -252,7 +271,10 @@ class GatewayProvider:
             if spa_hit is not None:
                 body, content_type, cache_control = spa_hit
                 await send_bytes(
-                    send, 200, body, content_type=content_type,
+                    send,
+                    200,
+                    body,
+                    content_type=content_type,
                     extra_headers={"Cache-Control": cache_control},
                 )
                 return
@@ -264,7 +286,8 @@ class GatewayProvider:
             return
         if match.route is None:
             await send_json(
-                send, 405,
+                send,
+                405,
                 {"error": "method not allowed", "allowed": sorted(match.allowed_methods)},
                 extra_headers={"Allow": ", ".join(sorted(match.allowed_methods))},
             )
@@ -325,23 +348,39 @@ class GatewayProvider:
                 # way, which is itself the signal something went wrong.
                 _logger.exception("unhandled exception while streaming %s %s", method, path)
                 try:
-                    await send({
-                        "type": "http.response.body",
-                        "body": encode_json({"error": "internal server error"}) + b"\n",
-                        "more_body": False,
-                    })
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": encode_json({"error": "internal server error"}) + b"\n",
+                            "more_body": False,
+                        }
+                    )
                 except Exception:
                     pass
             return
 
         if isinstance(result, Response):
             if result.media_type == "application/json":
-                await send_json(send, result.status_code, result.content, extra_headers=result.headers, cookies=result.cookies)
+                await send_json(
+                    send,
+                    result.status_code,
+                    result.content,
+                    extra_headers=result.headers,
+                    cookies=result.cookies,
+                )
             else:
-                body = result.content if isinstance(result.content, bytes) else str(result.content).encode("utf-8")
+                body = (
+                    result.content
+                    if isinstance(result.content, bytes)
+                    else str(result.content).encode("utf-8")
+                )
                 await send_bytes(
-                    send, result.status_code, body,
-                    content_type=result.media_type, extra_headers=result.headers, cookies=result.cookies,
+                    send,
+                    result.status_code,
+                    body,
+                    content_type=result.media_type,
+                    extra_headers=result.headers,
+                    cookies=result.cookies,
                 )
         else:
             await send_json(send, 200, result)
@@ -462,9 +501,7 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(MAX_BODY_BYTES_KEY)
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
-    cors_origins = (
-        [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else None
-    )
+    cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else None
     csrf_enabled = (kernel.settings.get(CSRF_ENABLED_KEY) or "").lower() in ("1", "true", "yes")
     force_https = (kernel.settings.get(FORCE_HTTPS_KEY) or "").lower() in ("1", "true", "yes")
     raw_proxies = kernel.settings.get(TRUSTED_PROXIES_KEY)
@@ -476,8 +513,12 @@ def register(kernel: Any) -> None:
     max_body_bytes = int(raw_max_body) if raw_max_body else DEFAULT_MAX_BODY_BYTES
 
     provider = GatewayProvider(
-        kernel, cors_origins=cors_origins, csrf_enabled=csrf_enabled, hsts=force_https,
-        trusted_proxies=trusted_proxies, forwarded_header=forwarded_header,
+        kernel,
+        cors_origins=cors_origins,
+        csrf_enabled=csrf_enabled,
+        hsts=force_https,
+        trusted_proxies=trusted_proxies,
+        forwarded_header=forwarded_header,
         max_body_bytes=max_body_bytes,
     )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=["authn"])

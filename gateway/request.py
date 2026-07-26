@@ -149,8 +149,8 @@ class Request:
     validated: Any = None  # set when the matched route declared a request_schema
     identity: Any = None  # set by the identity-resolution middleware, if authn is present
     client_ip: str | None = None  # set by client_ip_middleware — proxy-aware if
-                                   # trusted_proxies is configured, raw scope["client"]
-                                   # otherwise
+    # trusted_proxies is configured, raw scope["client"]
+    # otherwise
     cookies: dict[str, str] = field(default_factory=dict)  # parsed from the Cookie header
 
     def json(self, schema: Any | None = None) -> Any:
@@ -198,10 +198,7 @@ async def read_body(receive, *, max_bytes: int | None = None) -> bytes:
 
 
 def headers_from_scope(scope: dict) -> dict[str, str]:
-    return {
-        k.decode("latin-1").lower(): v.decode("latin-1")
-        for k, v in scope.get("headers", [])
-    }
+    return {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
 
 
 def get_header(scope: dict, name: bytes) -> bytes | None:
@@ -240,9 +237,15 @@ def encode_json(value: Any) -> bytes:
 
 
 _PHRASES = {
-    200: "OK", 201: "Created", 204: "No Content",
-    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
-    404: "Not Found", 405: "Method Not Allowed", 422: "Unprocessable Entity",
+    200: "OK",
+    201: "Created",
+    204: "No Content",
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    422: "Unprocessable Entity",
     500: "Internal Server Error",
 }
 
@@ -260,7 +263,14 @@ async def send_json(
     cookies: "list[Cookie] | None" = None,
 ) -> None:
     body = encode_json(content)
-    await send_bytes(send, status_code, body, content_type="application/json", extra_headers=extra_headers, cookies=cookies)
+    await send_bytes(
+        send,
+        status_code,
+        body,
+        content_type="application/json",
+        extra_headers=extra_headers,
+        cookies=cookies,
+    )
 
 
 async def send_bytes(
@@ -283,7 +293,5 @@ async def send_bytes(
     # that path; the ASGI headers list has no such one-value-per-key limit.
     for cookie in cookies or []:
         headers.append((b"set-cookie", cookie.encode()))
-    await send(
-        {"type": "http.response.start", "status": status_code, "headers": headers}
-    )
+    await send({"type": "http.response.start", "status": status_code, "headers": headers})
     await send({"type": "http.response.body", "body": body})

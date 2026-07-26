@@ -1,11 +1,11 @@
 """
 gateway.multipart
 ------------------
-Multipart/form-data parsing — a transport-level primitive only. Nothing in
-Gateway registers a route that uses this yet (no whitelisted upload API, no
-attachment storage) — that's a separate, later phase. This just makes
-Gateway capable of turning a multipart body into fields/files when a future
-handler asks for it via `Request.form()`.
+Multipart/form-data parsing — a transport-level primitive, real
+Request.form() is built directly on this (see request.py). In active use:
+filer's `POST /files/upload` (plugins/filer/filer/api/filer_api.py) is a
+real whitelisted route that calls request.form() to get at the uploaded
+file, and hrms's employee-file API goes through the same path.
 
 Deliberately covers the common case browsers/curl/httpx actually produce —
 a single-level "multipart/form-data" body, one part per field/file — not a

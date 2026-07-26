@@ -47,20 +47,23 @@ def serve(
     workers: int = typer.Option(1, "--workers"),
     reload: bool = typer.Option(False, "--reload", help="Restart on source changes (dev only)."),
     target: str = typer.Option(
-        "gateway._asgi_entrypoint:app", "--app",
+        "gateway._asgi_entrypoint:app",
+        "--app",
         help="Import target Granian loads fresh in every worker. The default "
-             "just boots arc with no extra routes. Point this at your own "
-             "module if it needs to register routes beyond arc.boot() alone "
-             "— e.g. `myproject.entrypoint:app`, where that module does "
-             "`import arc; arc.boot(); arc.gateway.add_route(...); "
-             "app = arc.gateway`.",
+        "just boots arc with no extra routes. Point this at your own "
+        "module if it needs to register routes beyond arc.boot() alone "
+        "— e.g. `myproject.entrypoint:app`, where that module does "
+        "`import arc; arc.boot(); arc.gateway.add_route(...); "
+        "app = arc.gateway`.",
     ),
 ) -> None:
     """Serve arc.gateway over HTTP using Granian. Each worker process boots
     arc independently, matching §3.6."""
     root = find_project_root()
     if root is None:
-        err_console.print("Not inside an ARC project (no .arc/arc.toml found here or in any parent).")
+        err_console.print(
+            "Not inside an ARC project (no .arc/arc.toml found here or in any parent)."
+        )
         raise typer.Exit(code=1)
     granian_bin = _resolve_sibling_executable("granian")
     if granian_bin is None:
@@ -72,8 +75,16 @@ def serve(
         raise typer.Exit(code=1)
 
     argv = [
-        granian_bin, "--interface", "asgi", target,
-        "--host", host, "--port", str(port), "--workers", str(workers),
+        granian_bin,
+        "--interface",
+        "asgi",
+        target,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--workers",
+        str(workers),
     ]
     if reload:
         argv.append("--reload")
@@ -82,17 +93,20 @@ def serve(
     # execvp: a candidate containing "/" (the resolved sibling path always
     # does) is used directly, no PATH search — correct either way this
     # resolved, PATH-dependent or not.
-    os.execvp(granian_bin, argv)  # replace this process — real signal handling for a foreground server
+    os.execvp(
+        granian_bin, argv
+    )  # replace this process — real signal handling for a foreground server
 
 
 @app.command()
 def routes(
     app_module: str = typer.Option(
-        None, "--app",
+        None,
+        "--app",
         help="Import this module first (e.g. `myproject.entrypoint`) if your "
-             "application registers routes beyond arc.boot() alone — same "
-             "convention as `serve --app`. Without it, only routes registered "
-             "by arc.boot() itself are shown.",
+        "application registers routes beyond arc.boot() alone — same "
+        "convention as `serve --app`. Without it, only routes registered "
+        "by arc.boot() itself are shown.",
     ),
 ) -> None:
     """List every route currently registered on arc.gateway."""
