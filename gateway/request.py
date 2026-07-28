@@ -152,6 +152,11 @@ class Request:
     # trusted_proxies is configured, raw scope["client"]
     # otherwise
     cookies: dict[str, str] = field(default_factory=dict)  # parsed from the Cookie header
+    request_id: str | None = None  # set by request_id_middleware — one correlation id
+    # per request, echoed back as the X-Request-ID
+    # response header and carried into relay's own
+    # CallContext (so a background job this request
+    # enqueues can be traced back to it)
 
     def json(self, schema: Any | None = None) -> Any:
         if schema is not None:

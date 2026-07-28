@@ -3,8 +3,14 @@ gateway.middleware
 -------------------
 Standard ASGI middleware convention throughout: `middleware(app) -> app`,
 where `app(scope, receive, send)` is awaitable. Composed in a fixed order
-(see gateway/__init__.py): security headers -> CORS -> CSRF -> client_ip ->
-identity -> access_log.
+(see gateway/__init__.py): request_id -> security headers -> CORS -> CSRF ->
+client_ip -> identity -> access_log.
+
+request_id_middleware is OUTERMOST deliberately — every other middleware
+(and the access log innermost of all) can then read
+scope["state"]["arc_request_id"], and a request that is rejected early
+(a CSRF failure, a 413 body-too-large) still carries the same correlation
+id in its response as one that reached a handler.
 
 The identity-resolution slot (§3.3/§3.13) is unconditional — composed into
 the pipeline always, resolving `kernel.get("authn")` lazily PER REQUEST
@@ -24,7 +30,9 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
 import time
+import uuid
 from typing import Any, Awaitable, Callable
 
 from .request import cookies_from_scope, get_header
@@ -64,6 +72,61 @@ class RequestMetrics:
             "by_status_class": dict(self._by_status_class),
             "avg_duration_ms": round(avg, 1),
         }
+
+
+REQUEST_ID_HEADER = b"x-request-id"
+
+# What an inbound X-Request-ID must look like to be trusted and reused.
+# Deliberately strict: this value ends up in structured log lines, in a
+# response header, and (via relay's CallContext) in a `_job_log` row — all
+# places where an attacker-chosen string containing newlines, quotes, or
+# control characters is a log-forging/injection concern, not just noise.
+# Anything that doesn't match is silently REPLACED with a fresh id rather
+# than rejected: a correlation id is a debugging aid, never a reason to
+# fail a request the caller otherwise got right.
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def new_request_id() -> str:
+    return uuid.uuid4().hex
+
+
+def request_id_middleware() -> Middleware:
+    """Assigns every request a correlation id, readable downstream as
+    `scope["state"]["arc_request_id"]` (gateway's dispatcher puts it on
+    `Request.request_id`; relay copies it into its own CallContext so a
+    background job enqueued by this request can be traced back to it) and
+    echoed to the caller as an `X-Request-ID` response header.
+
+    An inbound `X-Request-ID` is honored when it passes _SAFE_REQUEST_ID
+    above, so a request traced across several services keeps ONE id
+    end-to-end; anything else gets a fresh one. Always active — there is
+    no meaningful "off" state for this, same reasoning as
+    client_ip_middleware."""
+
+    def middleware(app: ASGIApp) -> ASGIApp:
+        async def wrapped(scope, receive, send):
+            if scope["type"] != "http":
+                return await app(scope, receive, send)
+
+            raw = get_header(scope, REQUEST_ID_HEADER)
+            inbound = raw.decode("latin-1", errors="replace") if raw else ""
+            request_id = inbound if _SAFE_REQUEST_ID.match(inbound) else new_request_id()
+
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start":
+                    headers = list(message.get("headers", []))
+                    if not any(k.lower() == REQUEST_ID_HEADER for k, _ in headers):
+                        headers.append((REQUEST_ID_HEADER, request_id.encode("latin-1")))
+                    message = {**message, "headers": headers}
+                await send(message)
+
+            scope = {**scope, "state": {**scope.get("state", {}), "arc_request_id": request_id}}
+            await app(scope, receive, send_wrapper)
+
+        return wrapped
+
+    return middleware
 
 
 def security_headers_middleware(*, hsts: bool = False) -> Middleware:
@@ -164,8 +227,9 @@ def cors_middleware(allowed_origins: list[str] | None) -> Middleware:
 
 
 def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> Middleware:
-    """Opt-in (default off) — matters for cookie-session auth, not bearer
-    tokens, so most API-only deployments never need it on. When enabled,
+    """Default on (see register()'s own comment for why) — matters for
+    cookie-session auth, not bearer tokens, so most API-only deployments
+    never notice it. When enabled,
     unsafe methods carrying an `arc_session` cookie must also carry a
     `X-CSRF-Token` header matching a `csrf_token` cookie (the standard
     double-submit-cookie pattern).
@@ -329,8 +393,9 @@ def access_log_middleware(metrics: RequestMetrics) -> Middleware:
     both jobs, no second pass over every request.
 
     Innermost builtin middleware (see module docstring): reads
-    scope["state"]["arc_client_ip"]/["arc_identity"], both only populated
-    by client_ip_middleware/identity_middleware ahead of it in the chain.
+    scope["state"]["arc_client_ip"]/["arc_identity"]/["arc_request_id"],
+    all only populated by client_ip/identity/request_id middleware ahead
+    of it in the chain.
 
     Wrapped in try/finally, not a bare call — a request that raises all
     the way through (a bug even gateway's own dispatcher catch-all didn't
@@ -360,6 +425,7 @@ def access_log_middleware(metrics: RequestMetrics) -> Middleware:
                 _logger.info(
                     "request",
                     extra={
+                        "request_id": state.get("arc_request_id"),
                         "method": scope["method"],
                         "path": scope["path"],
                         "status": status,

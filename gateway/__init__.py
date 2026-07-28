@@ -38,6 +38,7 @@ from .middleware import (
     cors_middleware,
     csrf_middleware,
     identity_middleware,
+    request_id_middleware,
     security_headers_middleware,
 )
 from .openapi import build_openapi_spec
@@ -97,19 +98,23 @@ class GatewayProvider:
         self._max_body_bytes = max_body_bytes
         self._metrics = RequestMetrics()
 
-        # Fixed order: security headers -> CORS -> CSRF -> client_ip -> identity
-        # -> access_log. Both client_ip and identity are unconditional now —
-        # identity_middleware looks up kernel.has("authn")/kernel.get("authn")
-        # lazily per request rather than once here at construction time (see
-        # its own docstring): authn optionally-requiring gateway doesn't
-        # guarantee gateway registers AFTER authn (arc's resolver only orders
-        # HARD requires strictly, §3.1) — `arc doctor` warns exactly this
-        # ordering can happen — so a boot-time kernel.has("authn") check here
-        # could easily see False even with authn fully installed, silently
-        # disabling identity resolution. access_log is innermost — it reads
-        # scope["state"] fields only client_ip/identity have populated by then.
-        self._client_ip_mw_index = 3
+        # Fixed order: request_id -> security headers -> CORS -> CSRF ->
+        # client_ip -> identity -> access_log. request_id is OUTERMOST so
+        # every other middleware — and any early rejection that never
+        # reaches a handler at all (a CSRF 403, a 413) — still carries the
+        # same correlation id. Both client_ip and identity are
+        # unconditional now — identity_middleware looks up
+        # kernel.has("authn")/kernel.get("authn") lazily per request rather
+        # than once here at construction time (see its own docstring): authn
+        # optionally-requiring gateway doesn't guarantee gateway registers
+        # AFTER authn (arc's resolver only orders HARD requires strictly,
+        # §3.1) — `arc doctor` warns exactly this ordering can happen — so a
+        # boot-time kernel.has("authn") check here could easily see False
+        # even with authn fully installed, silently disabling identity
+        # resolution. access_log is innermost — it reads scope["state"]
+        # fields only request_id/client_ip/identity have populated by then.
         self._builtin_middlewares: list[Callable[[ASGIApp], ASGIApp]] = [
+            request_id_middleware(),
             security_headers_middleware(hsts=hsts),
             cors_middleware(cors_origins),
             csrf_middleware(enabled=csrf_enabled),
@@ -117,6 +122,11 @@ class GatewayProvider:
             identity_middleware(kernel),
             access_log_middleware(self._metrics),
         ]
+        # Derived, never hand-counted: set_trusted_proxies() rebuilds the
+        # client_ip middleware in place, and a hardcoded index here silently
+        # rebuilt the WRONG entry the moment anything was inserted ahead of
+        # it in the list above.
+        self._client_ip_mw_index = len(self._builtin_middlewares) - 3
 
         self._register_builtin_routes()
 
@@ -311,6 +321,7 @@ class GatewayProvider:
             identity=scope.get("state", {}).get("arc_identity"),
             client_ip=scope.get("state", {}).get("arc_client_ip"),
             cookies=cookies_from_scope(scope),
+            request_id=scope.get("state", {}).get("arc_request_id"),
         )
 
         if route.request_schema is not None:
@@ -502,7 +513,16 @@ def register(kernel: Any) -> None:
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
     cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else None
-    csrf_enabled = (kernel.settings.get(CSRF_ENABLED_KEY) or "").lower() in ("1", "true", "yes")
+    # Defaults ON (unlike CORS/force-https above, which default off) — the
+    # CSRF middleware itself only ever acts on a request that ALREADY
+    # carries an arc_session cookie (see csrf_middleware's own docstring:
+    # a bearer/API-key-only deployment, or a request with no session yet
+    # such as /login, is untouched either way), so there is no ordinary
+    # request shape this newly starts rejecting. An operator who genuinely
+    # wants it off sets the setting to "false"/"0"/"no" explicitly — the
+    # `or "true"` here only supplies the fallback when the setting has
+    # never been touched at all (kernel.settings.get returns None/"").
+    csrf_enabled = (kernel.settings.get(CSRF_ENABLED_KEY) or "true").lower() in ("1", "true", "yes")
     force_https = (kernel.settings.get(FORCE_HTTPS_KEY) or "").lower() in ("1", "true", "yes")
     raw_proxies = kernel.settings.get(TRUSTED_PROXIES_KEY)
     trusted_proxies = (
