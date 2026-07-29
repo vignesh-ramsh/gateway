@@ -422,12 +422,14 @@ def access_log_middleware(metrics: RequestMetrics) -> Middleware:
                 status = status_holder.get("status", 0)
                 state = scope.get("state", {})
                 identity = state.get("arc_identity")
+                method = scope["method"]
+                path = scope["path"]
                 _logger.info(
-                    "request",
+                    f"{method} {path} -> {status} ({duration_ms:.0f}ms)",
                     extra={
                         "request_id": state.get("arc_request_id"),
-                        "method": scope["method"],
-                        "path": scope["path"],
+                        "method": method,
+                        "path": path,
                         "status": status,
                         "duration_ms": round(duration_ms, 1),
                         "client_ip": state.get("arc_client_ip"),
