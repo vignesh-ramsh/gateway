@@ -28,6 +28,7 @@ the two middlewares ahead of it in the chain.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
@@ -35,7 +36,7 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
-from .request import cookies_from_scope, get_header
+from .request import cookies_from_scope, get_header, send_json
 
 _logger = logging.getLogger("gateway")
 
@@ -437,6 +438,122 @@ def access_log_middleware(metrics: RequestMetrics) -> Middleware:
                     },
                 )
                 metrics.record(status, duration_ms)
+
+        return wrapped
+
+    return middleware
+
+
+# In-process counters, attacker-growable (one entry per distinct key seen) —
+# same prune-past-threshold posture as authn's own _rate_local (plugins/
+# authn/authn/__init__.py), and the same number, not a coincidence: both
+# are "how many distinct (ip/user) keys before we bother evicting stale
+# ones", not a tuned-per-feature value.
+_FALLBACK_PRUNE_THRESHOLD = 4096
+
+
+class LocalRateLimiter:
+    """In-process fixed-window counter — what rate_limit_middleware falls
+    back to when redix isn't installed, or a redix call itself fails.
+    Same shape as authn's own rate_limit() fallback, and for the identical
+    reason (see that function's docstring): per-process, not distributed
+    (a multi-worker deployment gets one independent counter PER WORKER, so
+    the effective limit across the whole process group is `limit *
+    worker_count`, not `limit`), and reset on restart. Weaker than redix's
+    shared counter, but "some protection, degrading gracefully" beats
+    either forcing Redis as a hard dependency or having no protection at
+    all when it's absent — same posture as every redix-optional feature
+    elsewhere in this codebase."""
+
+    def __init__(self) -> None:
+        self._counts: dict[str, tuple[int, float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def allow(self, key: str, limit: int, window_seconds: int) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            if len(self._counts) > _FALLBACK_PRUNE_THRESHOLD:
+                self._counts = {
+                    k: (c, start)
+                    for k, (c, start) in self._counts.items()
+                    if now - start < window_seconds
+                }
+            count, window_start = self._counts.get(key, (0, now))
+            if now - window_start >= window_seconds:
+                count, window_start = 0, now
+            count += 1
+            self._counts[key] = (count, window_start)
+            return count <= limit
+
+
+def rate_limit_middleware(
+    kernel: Any,
+    *,
+    enabled: bool,
+    limit: int,
+    window_seconds: int,
+    fallback: LocalRateLimiter,
+) -> Middleware:
+    """Innermost of every builtin middleware (see gateway/__init__.py's own
+    composition comment) — deliberately positioned so access_log_middleware
+    wraps THIS, not the other way around: a 429 rejection here must still
+    produce a real access-log line and update RequestMetrics like any other
+    response, not vanish before ever reaching access_log because this
+    short-circuited ahead of it.
+
+    Keyed per authenticated identity when one resolved
+    (scope["state"]["arc_identity"], set by identity_middleware ahead of
+    this in the chain — user_id specifically, the same identifier relay's
+    own CallContext uses elsewhere), falling back to client IP
+    (scope["state"]["arc_client_ip"], set by client_ip_middleware) for
+    anonymous traffic. Per-user beats per-IP whenever it's available — one
+    NAT'd office or corporate VPN egress otherwise shares a single budget
+    across everyone behind it.
+
+    redix is looked up lazily, per request — never once when this closure
+    is built. Same boot-order reasoning identity_middleware's own
+    docstring documents at length: gateway optionally-requiring redix
+    doesn't guarantee redix has already registered by the time this
+    function runs, only that it's registered by the time a REQUEST is
+    served. A redix call that raises (Redis down) degrades to the
+    in-process fallback rather than failing every request — rate limiting
+    is a protective layer, not something allowed to take the app down
+    if Redis has a bad moment (same "cache/lock errors degrade, they
+    never propagate" posture authn's own session cache already uses)."""
+
+    def middleware(app: ASGIApp) -> ASGIApp:
+        async def wrapped(scope, receive, send):
+            if not enabled or scope["type"] != "http":
+                return await app(scope, receive, send)
+
+            state = scope.get("state", {})
+            identity = state.get("arc_identity")
+            user_id = getattr(identity, "user_id", None)
+            client_ip = state.get("arc_client_ip")
+            key = f"user:{user_id}" if user_id else f"ip:{client_ip or 'unknown'}"
+
+            redix = kernel.get("redix") if kernel.has("redix") else None
+            if redix is not None:
+                try:
+                    allowed = await redix.rate_limit(key, limit, window_seconds)
+                except Exception as exc:
+                    _logger.warning(
+                        "redix rate_limit failed (%s) — using in-process fallback", exc
+                    )
+                    allowed = await fallback.allow(key, limit, window_seconds)
+            else:
+                allowed = await fallback.allow(key, limit, window_seconds)
+
+            if not allowed:
+                await send_json(
+                    send,
+                    429,
+                    {"error": "rate limit exceeded", "code": "rate_limited"},
+                    extra_headers={"Retry-After": str(window_seconds)},
+                )
+                return
+
+            await app(scope, receive, send)
 
         return wrapped
 

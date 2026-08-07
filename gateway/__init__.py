@@ -32,12 +32,14 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .middleware import (
+    LocalRateLimiter,
     RequestMetrics,
     access_log_middleware,
     client_ip_middleware,
     cors_middleware,
     csrf_middleware,
     identity_middleware,
+    rate_limit_middleware,
     request_id_middleware,
     security_headers_middleware,
 )
@@ -69,6 +71,18 @@ MAX_BODY_BYTES_KEY = "gateway_max_body_bytes"
 DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB — generous for a JSON API body,
 # nowhere near "unbounded" (the bug this fixes)
 
+RATE_LIMIT_ENABLED_KEY = "gateway_rate_limit_enabled"
+RATE_LIMIT_REQUESTS_KEY = "gateway_rate_limit_requests"
+RATE_LIMIT_WINDOW_SECONDS_KEY = "gateway_rate_limit_window_seconds"
+# 300 req/60s (5/sec sustained) — generous enough that normal admin-console
+# usage (a page load firing several requests near-simultaneously, infinite
+# scroll, debounced search/sort) never approaches it; only sustained
+# scripted/abusive traffic does. Same "no ordinary request shape newly
+# rejected" bar CSRF's own default-on comment sets, applied to volume
+# instead of shape.
+DEFAULT_RATE_LIMIT_REQUESTS = 300
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
+
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 
 _logger = logging.getLogger("gateway")
@@ -85,6 +99,9 @@ class GatewayProvider:
         trusted_proxies: list[str] | None = None,
         forwarded_header: str = "X-Forwarded-For",
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        rate_limit_enabled: bool = True,
+        rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
+        rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
     ) -> None:
         self._kernel = kernel
         self._router = Router()
@@ -97,13 +114,14 @@ class GatewayProvider:
         self._forwarded_header = forwarded_header
         self._max_body_bytes = max_body_bytes
         self._metrics = RequestMetrics()
+        self._rate_limit_fallback = LocalRateLimiter()
 
         # Fixed order: request_id -> security headers -> CORS -> CSRF ->
-        # client_ip -> identity -> access_log. request_id is OUTERMOST so
-        # every other middleware — and any early rejection that never
-        # reaches a handler at all (a CSRF 403, a 413) — still carries the
-        # same correlation id. Both client_ip and identity are
-        # unconditional now — identity_middleware looks up
+        # client_ip -> identity -> access_log -> rate_limit. request_id is
+        # OUTERMOST so every other middleware — and any early rejection
+        # that never reaches a handler at all (a CSRF 403, a 413, a 429) —
+        # still carries the same correlation id. Both client_ip and
+        # identity are unconditional now — identity_middleware looks up
         # kernel.has("authn")/kernel.get("authn") lazily per request rather
         # than once here at construction time (see its own docstring): authn
         # optionally-requiring gateway doesn't guarantee gateway registers
@@ -111,22 +129,36 @@ class GatewayProvider:
         # §3.1) — `arc doctor` warns exactly this ordering can happen — so a
         # boot-time kernel.has("authn") check here could easily see False
         # even with authn fully installed, silently disabling identity
-        # resolution. access_log is innermost — it reads scope["state"]
-        # fields only request_id/client_ip/identity have populated by then.
+        # resolution. rate_limit_middleware follows the same lazy-lookup
+        # reasoning for redix. access_log sits BETWEEN identity and
+        # rate_limit, not after both — it reads scope["state"] fields only
+        # request_id/client_ip/identity have populated by then, and it must
+        # WRAP rate_limit (not the other way around) so a 429 rejection
+        # still produces a real access-log line instead of short-circuiting
+        # before ever reaching it.
         self._builtin_middlewares: list[Callable[[ASGIApp], ASGIApp]] = [
             request_id_middleware(),
             security_headers_middleware(hsts=hsts),
             cors_middleware(cors_origins),
             csrf_middleware(enabled=csrf_enabled),
             self._build_client_ip_middleware(),
+        ]
+        # Captured right where client_ip is appended, not derived from the
+        # final list length — a "len(...) - N" offset (the previous
+        # approach) silently breaks the moment anything is ever added
+        # after it, exactly what rate_limit_middleware below now does.
+        self._client_ip_mw_index = len(self._builtin_middlewares) - 1
+        self._builtin_middlewares += [
             identity_middleware(kernel),
             access_log_middleware(self._metrics),
+            rate_limit_middleware(
+                kernel,
+                enabled=rate_limit_enabled,
+                limit=rate_limit_requests,
+                window_seconds=rate_limit_window_seconds,
+                fallback=self._rate_limit_fallback,
+            ),
         ]
-        # Derived, never hand-counted: set_trusted_proxies() rebuilds the
-        # client_ip middleware in place, and a hardcoded index here silently
-        # rebuilt the WRONG entry the moment anything was inserted ahead of
-        # it in the list above.
-        self._client_ip_mw_index = len(self._builtin_middlewares) - 3
 
         self._register_builtin_routes()
 
@@ -510,6 +542,9 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(TRUSTED_PROXIES_KEY)
     kernel.settings.declare(FORWARDED_HEADER_KEY)
     kernel.settings.declare(MAX_BODY_BYTES_KEY)
+    kernel.settings.declare(RATE_LIMIT_ENABLED_KEY)
+    kernel.settings.declare(RATE_LIMIT_REQUESTS_KEY)
+    kernel.settings.declare(RATE_LIMIT_WINDOW_SECONDS_KEY)
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
     cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else None
@@ -531,6 +566,21 @@ def register(kernel: Any) -> None:
     forwarded_header = kernel.settings.get(FORWARDED_HEADER_KEY) or "X-Forwarded-For"
     raw_max_body = kernel.settings.get(MAX_BODY_BYTES_KEY)
     max_body_bytes = int(raw_max_body) if raw_max_body else DEFAULT_MAX_BODY_BYTES
+    # Defaults ON, same bar CSRF's own default-on comment above sets, just
+    # applied to request volume instead of request shape — see
+    # DEFAULT_RATE_LIMIT_REQUESTS's own comment for why 300/60s clears
+    # ordinary usage without meaningfully weakening the protection.
+    rate_limit_enabled = (
+        kernel.settings.get(RATE_LIMIT_ENABLED_KEY) or "true"
+    ).lower() in ("1", "true", "yes")
+    raw_rate_limit_requests = kernel.settings.get(RATE_LIMIT_REQUESTS_KEY)
+    rate_limit_requests = (
+        int(raw_rate_limit_requests) if raw_rate_limit_requests else DEFAULT_RATE_LIMIT_REQUESTS
+    )
+    raw_rate_limit_window = kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY)
+    rate_limit_window_seconds = (
+        int(raw_rate_limit_window) if raw_rate_limit_window else DEFAULT_RATE_LIMIT_WINDOW_SECONDS
+    )
 
     provider = GatewayProvider(
         kernel,
@@ -540,5 +590,8 @@ def register(kernel: Any) -> None:
         trusted_proxies=trusted_proxies,
         forwarded_header=forwarded_header,
         max_body_bytes=max_body_bytes,
+        rate_limit_enabled=rate_limit_enabled,
+        rate_limit_requests=rate_limit_requests,
+        rate_limit_window_seconds=rate_limit_window_seconds,
     )
-    kernel.export(CAPABILITY, provider, requires=[], optional_requires=["authn"])
+    kernel.export(CAPABILITY, provider, requires=[], optional_requires=["authn", "redix"])
