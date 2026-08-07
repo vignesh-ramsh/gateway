@@ -37,11 +37,13 @@ from .middleware import (
     LocalRateLimiter,
     RequestMetrics,
     access_log_middleware,
+    check_rate_limit,
     client_ip_middleware,
     cors_middleware,
     csrf_middleware,
     identity_middleware,
     new_request_id,
+    rate_limit_key,
     rate_limit_middleware,
     request_id_middleware,
     resolve_client_ip,
@@ -64,7 +66,7 @@ from .request import (
     send_stream,
 )
 from .router import WEBSOCKET_METHOD, Router, RouterError
-from .websocket import POLICY_VIOLATION, WebSocketConnection
+from .websocket import POLICY_VIOLATION, RATE_LIMITED, WebSocketConnection
 
 CAPABILITY = "gateway"
 
@@ -122,6 +124,15 @@ class GatewayProvider:
         self._max_body_bytes = max_body_bytes
         self._metrics = RequestMetrics()
         self._rate_limit_fallback = LocalRateLimiter()
+        # Stored (not just handed to rate_limit_middleware's own closure
+        # below) because _dispatch_websocket needs these too — a
+        # WebSocket connection is routed around the HTTP middleware chain
+        # entirely (see __call__), so it can't reach them through the
+        # middleware the way an ordinary request does; it reads them
+        # directly off self instead.
+        self._rate_limit_enabled = rate_limit_enabled
+        self._rate_limit_requests = rate_limit_requests
+        self._rate_limit_window_seconds = rate_limit_window_seconds
         # channel -> every locally-held WebSocketConnection subscribed to
         # it (GatewayProvider.broadcast()/subscribe()'s own docstrings have
         # the full design). One redix pub/sub listener task per channel
@@ -650,6 +661,32 @@ class GatewayProvider:
             )
             identity = None
 
+        client_ip = resolve_client_ip(
+            scope,
+            trusted_proxies=set(self._trusted_proxies),
+            forwarded_header=self._forwarded_header.encode("latin-1").lower(),
+        )
+        rl_key = rate_limit_key(identity, client_ip)
+
+        # Rate-limited before the roles check, not after — a flood of
+        # connection attempts shouldn't get to pay the (small but real)
+        # cost of a roles decision before being turned away. Uses the
+        # SAME budget an HTTP request from this identity/IP would draw
+        # from (rate_limit_key returns the identical string either way):
+        # one shared "how many things is this caller starting" counter
+        # per identity/IP, not a separate invented pool just for WS.
+        if self._rate_limit_enabled:
+            allowed = await check_rate_limit(
+                self._kernel,
+                self._rate_limit_fallback,
+                rl_key,
+                self._rate_limit_requests,
+                self._rate_limit_window_seconds,
+            )
+            if not allowed:
+                await reject(RATE_LIMITED)
+                return
+
         # Same three-branch authorization relay.whitelist()'s own
         # _wire_gateway_route uses (relay/__init__.py) — not a
         # WS-specific reinterpretation of "*"/"Guest", the identical
@@ -665,11 +702,19 @@ class GatewayProvider:
             await reject(POLICY_VIOLATION)
             return
 
-        client_ip = resolve_client_ip(
-            scope,
-            trusted_proxies=set(self._trusted_proxies),
-            forwarded_header=self._forwarded_header.encode("latin-1").lower(),
-        )
+        async def check_message_rate() -> bool:
+            # A DIFFERENT counter from the connection-attempt check above
+            # (own key prefix) — sharing one budget between "how many
+            # connections you've opened" and "how many messages you've
+            # sent on an already-open one" would let a single active chat
+            # session exhaust the same pool a fresh page load draws from.
+            return await check_rate_limit(
+                self._kernel,
+                self._rate_limit_fallback,
+                f"ws-message:{rl_key}",
+                self._rate_limit_requests,
+                self._rate_limit_window_seconds,
+            )
 
         connection = WebSocketConnection(
             scope,
@@ -681,6 +726,7 @@ class GatewayProvider:
             path_params=match.params,
             subscribe=self._ws_subscribe,
             unsubscribe=self._ws_unsubscribe,
+            rate_limited=check_message_rate if self._rate_limit_enabled else None,
         )
         try:
             await route.handler(connection)
@@ -804,62 +850,94 @@ class GatewayProvider:
 
 
 def register(kernel: Any) -> None:
-    kernel.settings.declare(CORS_ORIGINS_KEY)
-    kernel.settings.declare(CSRF_ENABLED_KEY)
-    kernel.settings.declare(FORCE_HTTPS_KEY)
-    kernel.settings.declare(TRUSTED_PROXIES_KEY)
-    kernel.settings.declare(FORWARDED_HEADER_KEY)
-    kernel.settings.declare(MAX_BODY_BYTES_KEY)
-    kernel.settings.declare(RATE_LIMIT_ENABLED_KEY)
-    kernel.settings.declare(RATE_LIMIT_REQUESTS_KEY)
-    kernel.settings.declare(RATE_LIMIT_WINDOW_SECONDS_KEY)
+    # Typed declare (matching authn's own adoption of this, arc/arc/
+    # settings.py's declare()) — every get() below already comes back as
+    # the right type, already defaulted, so there's no more hand-rolled
+    # int()/lower()-in-(...)/`or DEFAULT` per setting here. A bad value
+    # (e.g. gateway_max_body_bytes set to "ten megabytes") now fails at
+    # arc.boot() with a clear message naming the setting, instead of
+    # surfacing wherever the first request happens to read it. Only
+    # cors_origins/trusted_proxies stay untyped — both are comma-separated
+    # LISTS, and declare()'s `type` only covers int/float/bool/str, no
+    # list support, so there's nothing to hand those two off to.
+    kernel.settings.declare(
+        CORS_ORIGINS_KEY,
+        doc="Comma-separated allowed cross-origin hosts, or '*'. Empty/unset disables CORS.",
+    )
+    kernel.settings.declare(
+        CSRF_ENABLED_KEY,
+        type=bool,
+        default=True,
+        # Defaults ON (unlike force_https below) — the CSRF middleware
+        # itself only ever acts on a request that ALREADY carries an
+        # arc_session cookie (see csrf_middleware's own docstring: a
+        # bearer/API-key-only deployment, or a request with no session
+        # yet such as /login, is untouched either way), so there is no
+        # ordinary request shape this newly starts rejecting.
+        doc="Double-submit CSRF check on unsafe methods carrying a session cookie.",
+    )
+    kernel.settings.declare(
+        FORCE_HTTPS_KEY,
+        type=bool,
+        default=False,
+        doc="Send Strict-Transport-Security — only enable once served over TLS.",
+    )
+    kernel.settings.declare(
+        TRUSTED_PROXIES_KEY,
+        doc="Comma-separated trusted reverse-proxy IPs, for X-Forwarded-For parsing.",
+    )
+    kernel.settings.declare(
+        FORWARDED_HEADER_KEY,
+        default="X-Forwarded-For",
+        doc="Which header to trust for the client IP when trusted_proxies is set.",
+    )
+    kernel.settings.declare(
+        MAX_BODY_BYTES_KEY,
+        type=int,
+        default=DEFAULT_MAX_BODY_BYTES,
+        doc="Global request body size ceiling, in bytes.",
+    )
+    kernel.settings.declare(
+        RATE_LIMIT_ENABLED_KEY,
+        type=bool,
+        default=True,
+        # Defaults ON, same bar CSRF's own default-on note above sets,
+        # just applied to request volume instead of request shape — see
+        # DEFAULT_RATE_LIMIT_REQUESTS's own comment for why 300/60s
+        # clears ordinary usage without meaningfully weakening the
+        # protection.
+        doc="Per-identity/IP request-volume limiting.",
+    )
+    kernel.settings.declare(
+        RATE_LIMIT_REQUESTS_KEY,
+        type=int,
+        default=DEFAULT_RATE_LIMIT_REQUESTS,
+        doc="Requests allowed per window before a 429.",
+    )
+    kernel.settings.declare(
+        RATE_LIMIT_WINDOW_SECONDS_KEY,
+        type=int,
+        default=DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+        doc="Rate-limit window length, in seconds.",
+    )
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
     cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else None
-    # Defaults ON (unlike CORS/force-https above, which default off) — the
-    # CSRF middleware itself only ever acts on a request that ALREADY
-    # carries an arc_session cookie (see csrf_middleware's own docstring:
-    # a bearer/API-key-only deployment, or a request with no session yet
-    # such as /login, is untouched either way), so there is no ordinary
-    # request shape this newly starts rejecting. An operator who genuinely
-    # wants it off sets the setting to "false"/"0"/"no" explicitly — the
-    # `or "true"` here only supplies the fallback when the setting has
-    # never been touched at all (kernel.settings.get returns None/"").
-    csrf_enabled = (kernel.settings.get(CSRF_ENABLED_KEY) or "true").lower() in ("1", "true", "yes")
-    force_https = (kernel.settings.get(FORCE_HTTPS_KEY) or "").lower() in ("1", "true", "yes")
     raw_proxies = kernel.settings.get(TRUSTED_PROXIES_KEY)
     trusted_proxies = (
         [p.strip() for p in raw_proxies.split(",") if p.strip()] if raw_proxies else None
-    )
-    forwarded_header = kernel.settings.get(FORWARDED_HEADER_KEY) or "X-Forwarded-For"
-    raw_max_body = kernel.settings.get(MAX_BODY_BYTES_KEY)
-    max_body_bytes = int(raw_max_body) if raw_max_body else DEFAULT_MAX_BODY_BYTES
-    # Defaults ON, same bar CSRF's own default-on comment above sets, just
-    # applied to request volume instead of request shape — see
-    # DEFAULT_RATE_LIMIT_REQUESTS's own comment for why 300/60s clears
-    # ordinary usage without meaningfully weakening the protection.
-    rate_limit_enabled = (
-        kernel.settings.get(RATE_LIMIT_ENABLED_KEY) or "true"
-    ).lower() in ("1", "true", "yes")
-    raw_rate_limit_requests = kernel.settings.get(RATE_LIMIT_REQUESTS_KEY)
-    rate_limit_requests = (
-        int(raw_rate_limit_requests) if raw_rate_limit_requests else DEFAULT_RATE_LIMIT_REQUESTS
-    )
-    raw_rate_limit_window = kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY)
-    rate_limit_window_seconds = (
-        int(raw_rate_limit_window) if raw_rate_limit_window else DEFAULT_RATE_LIMIT_WINDOW_SECONDS
     )
 
     provider = GatewayProvider(
         kernel,
         cors_origins=cors_origins,
-        csrf_enabled=csrf_enabled,
-        hsts=force_https,
+        csrf_enabled=kernel.settings.get(CSRF_ENABLED_KEY),
+        hsts=kernel.settings.get(FORCE_HTTPS_KEY),
         trusted_proxies=trusted_proxies,
-        forwarded_header=forwarded_header,
-        max_body_bytes=max_body_bytes,
-        rate_limit_enabled=rate_limit_enabled,
-        rate_limit_requests=rate_limit_requests,
-        rate_limit_window_seconds=rate_limit_window_seconds,
+        forwarded_header=kernel.settings.get(FORWARDED_HEADER_KEY),
+        max_body_bytes=kernel.settings.get(MAX_BODY_BYTES_KEY),
+        rate_limit_enabled=kernel.settings.get(RATE_LIMIT_ENABLED_KEY),
+        rate_limit_requests=kernel.settings.get(RATE_LIMIT_REQUESTS_KEY),
+        rate_limit_window_seconds=kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY),
     )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=["authn", "redix"])

@@ -33,6 +33,16 @@ import arc
 # everything else (an ordinary, expected close).
 POLICY_VIOLATION = 1008
 
+# No standard WS close code means "rate limited" — the 4000-4999 range is
+# reserved for private/application use, so this echoes HTTP 429 numerically
+# rather than inventing an arbitrary number. Deliberately NOT 1008: a
+# client should treat this as "back off and retry", not "you're not
+# welcome here" — the default reconnect-with-backoff a well-behaved
+# client already has for an unexpected close is exactly the right
+# response, whereas POLICY_VIOLATION is specifically excluded from that
+# retry (see arc-gateway-websocket.MD §8's own client example).
+RATE_LIMITED = 4029
+
 
 class WebSocketDisconnect(Exception):
     """Raised out of receive_raw()/receive_json()/iter_json() the moment
@@ -63,6 +73,7 @@ class WebSocketConnection:
         path_params: dict[str, str],
         subscribe: Callable[["WebSocketConnection", str], Awaitable[None]],
         unsubscribe: Callable[["WebSocketConnection", str], Awaitable[None]],
+        rate_limited: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.scope = scope
         self.identity = identity
@@ -73,6 +84,14 @@ class WebSocketConnection:
         self._send = send
         self._subscribe_hub = subscribe
         self._unsubscribe_hub = unsubscribe
+        # Checked once per INBOUND message (receive_raw below) — the
+        # handshake already went through its own, separate rate-limit
+        # check (gateway/__init__.py's _dispatch_websocket) before this
+        # connection ever got constructed; this is the connection's
+        # ongoing per-message budget, not the one-time cost of opening it.
+        # None when rate_limit_enabled is off — every check becomes a
+        # no-op rather than a None-callable crash.
+        self._rate_limited = rate_limited
         self._channels: set[str] = set()
         self.accepted = False
         self.closed = False
@@ -147,11 +166,24 @@ class WebSocketConnection:
         """One raw ASGI websocket event: `websocket.receive` (carries
         "text" or "bytes") or `websocket.disconnect`, raised here as
         WebSocketDisconnect rather than handed back as a message every
-        caller has to remember to type-check first."""
+        caller has to remember to type-check first.
+
+        Also where the per-message rate-limit budget is enforced (see
+        __init__'s own comment on `_rate_limited`) — every one of
+        receive_text/receive_json/iter_json routes through this one
+        method, so a plugin's handler gets the protection automatically
+        just by using any of them, with no rate-limiting code of its own
+        to remember. Exceeding it closes the connection (RATE_LIMITED)
+        rather than silently dropping the one over-budget message — a
+        dropped message with no signal at all ("I sent something and
+        nothing happened") is worse UX than a clear, reconnectable close."""
         message = await self._receive()
         if message["type"] == "websocket.disconnect":
             self._wire_dead = True
             raise WebSocketDisconnect(message.get("code", 1000))
+        if self._rate_limited is not None and not await self._rate_limited():
+            await self.close(RATE_LIMITED)
+            raise WebSocketDisconnect(RATE_LIMITED)
         return message
 
     async def receive_text(self) -> str:

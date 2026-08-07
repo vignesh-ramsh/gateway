@@ -498,6 +498,38 @@ class LocalRateLimiter:
             return count <= limit
 
 
+def rate_limit_key(identity: Any, client_ip: str | None) -> str:
+    """Per-authenticated-identity when one resolved (user_id specifically,
+    the same identifier relay's own CallContext uses elsewhere), falling
+    back to client IP for anonymous traffic. Shared by every transport
+    that rate-limits — HTTP requests (rate_limit_middleware below) and
+    WebSocket connections/messages (gateway/__init__.py's
+    _dispatch_websocket, gateway/websocket.py's WebSocketConnection) — so
+    the SAME caller gets the SAME identity under any of them, not three
+    independently-invented key formats."""
+    user_id = getattr(identity, "user_id", None)
+    return f"user:{user_id}" if user_id else f"ip:{client_ip or 'unknown'}"
+
+
+async def check_rate_limit(
+    kernel: Any, fallback: LocalRateLimiter, key: str, limit: int, window_seconds: int
+) -> bool:
+    """The one place "is this key still within budget" gets decided —
+    redix when installed (looked up lazily, per call — see
+    rate_limit_middleware's own docstring for why never once at
+    construction time), degrading to the in-process fallback on any
+    redix failure. Used by rate_limit_middleware (HTTP) and directly by
+    gateway's WebSocket handshake/per-message checks, so all three share
+    one decision instead of three copies of the same try/except."""
+    redix = kernel.get("redix") if kernel.has("redix") else None
+    if redix is not None:
+        try:
+            return await redix.rate_limit(key, limit, window_seconds)
+        except Exception as exc:
+            _logger.warning("redix rate_limit failed (%s) — using in-process fallback", exc)
+    return await fallback.allow(key, limit, window_seconds)
+
+
 def rate_limit_middleware(
     kernel: Any,
     *,
@@ -539,22 +571,8 @@ def rate_limit_middleware(
                 return await app(scope, receive, send)
 
             state = scope.get("state", {})
-            identity = state.get("arc_identity")
-            user_id = getattr(identity, "user_id", None)
-            client_ip = state.get("arc_client_ip")
-            key = f"user:{user_id}" if user_id else f"ip:{client_ip or 'unknown'}"
-
-            redix = kernel.get("redix") if kernel.has("redix") else None
-            if redix is not None:
-                try:
-                    allowed = await redix.rate_limit(key, limit, window_seconds)
-                except Exception as exc:
-                    _logger.warning(
-                        "redix rate_limit failed (%s) — using in-process fallback", exc
-                    )
-                    allowed = await fallback.allow(key, limit, window_seconds)
-            else:
-                allowed = await fallback.allow(key, limit, window_seconds)
+            key = rate_limit_key(state.get("arc_identity"), state.get("arc_client_ip"))
+            allowed = await check_rate_limit(kernel, fallback, key, limit, window_seconds)
 
             if not allowed:
                 await send_json(
