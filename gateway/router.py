@@ -28,6 +28,16 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
+#: Synthetic "method" a WebSocket route is filed under in the SAME radix
+#: tree as ordinary HTTP routes — a WS path has no HTTP verb at all, but
+#: reusing one tree means the static-beats-param priority, path-param
+#: parsing, and 404-vs-405 distinction below are shared for free instead
+#: of duplicated in a second router. Uppercase, unreachable as a real HTTP
+#: method (ASGI/HTTP method tokens never contain a space or lowercase-only
+#: convention issue here — it just needs to never collide with a real verb).
+WEBSOCKET_METHOD = "WEBSOCKET"
+
+
 @dataclass(frozen=True)
 class RouteEntry:
     method: str
@@ -49,6 +59,15 @@ class RouteEntry:
     # accept a much bigger body than every other endpoint without raising
     # the shared global ceiling that bounds ordinary JSON payloads too.
     max_body_bytes: int | None = None
+    # WebSocket routes only (method == WEBSOCKET_METHOD) — who's allowed to
+    # open this connection, same shape as relay.whitelist()'s own `roles`
+    # (None/"*" meaning any authenticated identity). An ordinary HTTP route
+    # leaves this None: its own role check happens inside relay's whitelist
+    # wrapper (the thing actually registered as `handler` for that route),
+    # not here. WS has no such wrapper — nothing sits between a plugin's
+    # handler and the wire — so gateway checks this itself, at handshake
+    # time, before ever accepting the connection.
+    roles: frozenset[str] | None = None
 
 
 @dataclass
@@ -85,18 +104,7 @@ class Router:
     def __init__(self) -> None:
         self._root = _Node()
 
-    def add_route(
-        self,
-        method: str,
-        path: str,
-        handler: Callable[..., Any],
-        *,
-        request_schema: Any | None = None,
-        response_schema: Any | None = None,
-        summary: str | None = None,
-        max_body_bytes: int | None = None,
-    ) -> None:
-        method = method.upper()
+    def _ensure_node(self, path: str) -> _Node:
         node = self._root
         for seg in _split_path(path):
             if seg.startswith("{") and seg.endswith("}"):
@@ -116,7 +124,21 @@ class Router:
                 node = node.param_child
             else:
                 node = node.static.setdefault(seg, _Node())
+        return node
 
+    def add_route(
+        self,
+        method: str,
+        path: str,
+        handler: Callable[..., Any],
+        *,
+        request_schema: Any | None = None,
+        response_schema: Any | None = None,
+        summary: str | None = None,
+        max_body_bytes: int | None = None,
+    ) -> None:
+        method = method.upper()
+        node = self._ensure_node(path)
         if method in node.routes:
             raise RouterError(f"route already registered: {method} {path}")
         node.routes[method] = RouteEntry(
@@ -127,6 +149,25 @@ class Router:
             response_schema=response_schema,
             summary=summary,
             max_body_bytes=max_body_bytes,
+        )
+
+    def add_ws_route(
+        self,
+        path: str,
+        handler: Callable[..., Any],
+        *,
+        roles: frozenset[str] | None = None,
+        summary: str | None = None,
+    ) -> None:
+        node = self._ensure_node(path)
+        if WEBSOCKET_METHOD in node.routes:
+            raise RouterError(f"WebSocket route already registered: {path}")
+        node.routes[WEBSOCKET_METHOD] = RouteEntry(
+            method=WEBSOCKET_METHOD,
+            path=path,
+            handler=handler,
+            summary=summary,
+            roles=roles,
         )
 
     def match(self, method: str, path: str) -> MatchResult:

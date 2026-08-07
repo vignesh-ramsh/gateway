@@ -285,6 +285,37 @@ def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> M
     return middleware
 
 
+def resolve_client_ip(
+    scope: dict, *, trusted_proxies: set[str], forwarded_header: bytes
+) -> str | None:
+    """The anti-spoofing algorithm itself, factored out of
+    client_ip_middleware below so gateway's WS handshake path
+    (gateway/__init__.py's _dispatch_websocket) can resolve the same
+    client_ip the SAME way, without either duplicating this logic or
+    forcing a websocket scope through an HTTP-only middleware chain that
+    every other middleware in this file no-ops on anyway.
+
+    Walks the forwarded header from the RIGHTMOST entry (nearest hop)
+    inward. Each hop must be in trusted_proxies to keep walking past it;
+    the first untrusted hop found is the real client IP. Never trusts the
+    leftmost entry directly — a client can put anything it wants there."""
+    peer = scope.get("client")
+    fallback_ip = peer[0] if peer else None
+    ip = fallback_ip
+
+    if trusted_proxies:
+        header = get_header(scope, forwarded_header)
+        if header is not None:
+            hops = [h.strip() for h in header.decode("latin-1").split(",") if h.strip()]
+            ip = hops[0] if hops else fallback_ip  # all-trusted fallback: leftmost
+            for hop in reversed(hops):
+                if hop not in trusted_proxies:
+                    ip = hop
+                    break
+
+    return ip
+
+
 def client_ip_middleware(
     *, trusted_proxies: list[str] | None, forwarded_header: bytes
 ) -> Middleware:
@@ -293,13 +324,7 @@ def client_ip_middleware(
     means trust nothing and use the raw ASGI peer address. Must run BEFORE
     identity_middleware in the chain: authn's resolve_identity(scope) reads
     scope["state"]["arc_client_ip"] to enforce a user's allowed_ips, so it
-    has to already be populated by the time identity resolution runs.
-
-    Anti-spoofing algorithm: walk the forwarded header from the RIGHTMOST
-    entry (nearest hop) inward. Each hop must be in trusted_proxies to keep
-    walking past it; the first untrusted hop found is the real client IP.
-    Never trust the leftmost entry directly — a client can put anything it
-    wants there."""
+    has to already be populated by the time identity resolution runs."""
     proxies = set(trusted_proxies or [])
 
     def middleware(app: ASGIApp) -> ASGIApp:
@@ -307,20 +332,7 @@ def client_ip_middleware(
             if scope["type"] != "http":
                 return await app(scope, receive, send)
 
-            peer = scope.get("client")
-            fallback_ip = peer[0] if peer else None
-            ip = fallback_ip
-
-            if proxies:
-                header = get_header(scope, forwarded_header)
-                if header is not None:
-                    hops = [h.strip() for h in header.decode("latin-1").split(",") if h.strip()]
-                    ip = hops[0] if hops else fallback_ip  # all-trusted fallback: leftmost
-                    for hop in reversed(hops):
-                        if hop not in proxies:
-                            ip = hop
-                            break
-
+            ip = resolve_client_ip(scope, trusted_proxies=proxies, forwarded_header=forwarded_header)
             scope = {**scope, "state": {**scope.get("state", {}), "arc_client_ip": ip}}
             await app(scope, receive, send)
 

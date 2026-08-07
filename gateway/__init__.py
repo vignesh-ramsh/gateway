@@ -31,6 +31,8 @@ import mimetypes
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import arc
+
 from .middleware import (
     LocalRateLimiter,
     RequestMetrics,
@@ -39,8 +41,10 @@ from .middleware import (
     cors_middleware,
     csrf_middleware,
     identity_middleware,
+    new_request_id,
     rate_limit_middleware,
     request_id_middleware,
+    resolve_client_ip,
     security_headers_middleware,
 )
 from .openapi import build_openapi_spec
@@ -51,6 +55,7 @@ from .request import (
     StreamResponse,
     cookies_from_scope,
     encode_json,
+    get_header,
     headers_from_scope,
     query_params_from_scope,
     read_body,
@@ -58,7 +63,8 @@ from .request import (
     send_json,
     send_stream,
 )
-from .router import Router, RouterError
+from .router import WEBSOCKET_METHOD, Router, RouterError
+from .websocket import POLICY_VIOLATION, WebSocketConnection
 
 CAPABILITY = "gateway"
 
@@ -110,11 +116,19 @@ class GatewayProvider:
         self._spa_file_cache: dict[str, tuple[int, bytes, str]] = {}
         self._extra_middlewares: list[Callable[[ASGIApp], ASGIApp]] = []
         self._built_app: ASGIApp | None = None
+        self._cors_origins = cors_origins or []
         self._trusted_proxies = trusted_proxies or []
         self._forwarded_header = forwarded_header
         self._max_body_bytes = max_body_bytes
         self._metrics = RequestMetrics()
         self._rate_limit_fallback = LocalRateLimiter()
+        # channel -> every locally-held WebSocketConnection subscribed to
+        # it (GatewayProvider.broadcast()/subscribe()'s own docstrings have
+        # the full design). One redix pub/sub listener task per channel
+        # that has at least one local subscriber, started lazily on the
+        # first subscribe() and cancelled once the last one leaves.
+        self._ws_channels: dict[str, set[WebSocketConnection]] = {}
+        self._ws_redix_tasks: dict[str, asyncio.Task] = {}
 
         # Fixed order: request_id -> security headers -> CORS -> CSRF ->
         # client_ip -> identity -> access_log -> rate_limit. request_id is
@@ -221,6 +235,146 @@ class GatewayProvider:
         )
         self._built_app = None
 
+    def add_ws_route(
+        self,
+        path: str,
+        handler: Callable[[WebSocketConnection], Awaitable[None]],
+        *,
+        roles: list[str] | None = None,
+        summary: str | None = None,
+    ) -> None:
+        """Register a WebSocket endpoint — the WS counterpart to add_route,
+        but not routed through relay's whitelist() (see websocket.py's own
+        module docstring for why: whitelist()'s body/response plumbing is
+        single-request/response shaped and doesn't generalize to a
+        connection that exchanges many messages over its lifetime).
+
+        `handler(ws: WebSocketConnection)` is called once the connection
+        has ALREADY passed its roles check below and is ready for the
+        handler to `await ws.accept()` — never for a caller the roles
+        check would have rejected.
+
+        `roles`: the exact same sentinel convention relay.whitelist()
+        already uses, deliberately not a new one — `roles=None` (the
+        default) resolves to `{"*"}`, meaning any AUTHENTICATED identity
+        may connect, any role — NOT anonymous/public, despite the
+        wildcard name. An endpoint that should also accept anonymous
+        connections must say so explicitly with `roles=["Guest"]`, same
+        as an HTTP endpoint would. A caller whose own resolved roles
+        include "*" (authn's convention for Superuser) always connects
+        regardless of what this endpoint requires, symmetric with
+        whitelist()'s own caller-side bypass."""
+        first_segment = next((s for s in path.strip("/").split("/") if s), None)
+        if first_segment is not None and first_segment in self._spa_mounts:
+            raise RouterError(
+                f"cannot register WS route '{path}': '{first_segment}' is already "
+                f"mounted as an SPA prefix"
+            )
+        self._router.add_ws_route(
+            path,
+            handler,
+            roles=frozenset(roles) if roles is not None else frozenset({"*"}),
+            summary=summary,
+        )
+        self._built_app = None
+
+    # ------------------------------------------------------------------ #
+    # WebSocket broadcast — a channel is nothing but a string every
+    # WebSocketConnection.subscribe()'d to it agrees on; gateway itself
+    # never interprets one (a plugin might use "table:employee",
+    # "user:{id}", anything). See websocket.py's own module docstring for
+    # why this exists (relay.stream() only ever reaches the ONE connection
+    # that made the request; this reaches every OTHER connection watching
+    # too).
+    # ------------------------------------------------------------------ #
+    async def broadcast(self, channel: str, message: Any) -> None:
+        """Push `message` (any arc.codec-encodable value) to every
+        WebSocket connection currently subscribed to `channel` — across
+        every worker process when redix is installed, a plain in-process
+        call otherwise (reaching only THIS worker's own local subscribers
+        — a WS connection is pinned to whichever worker accepted it, same
+        per-process reality RequestMetrics/rate-limiting's fallback
+        already document elsewhere in this codebase).
+
+        Always round-trips through redix even for this worker's OWN local
+        subscribers, rather than delivering locally AND publishing — one
+        path, not two that could double-deliver or drift apart. This
+        worker's own _pump_redix_channel task (started the moment it has
+        its own first local subscriber) receives the just-published
+        message back from redix exactly like every other worker would,
+        Redis pub/sub not distinguishing "self" from any other subscriber."""
+        encoded = arc.codec.encode(message).decode("utf-8")
+        redix = self._kernel.get("redix") if self._kernel.has("redix") else None
+        if redix is not None:
+            try:
+                await redix.publish(channel, encoded)
+                return
+            except Exception as exc:
+                _logger.warning(
+                    "redix publish to channel %r failed (%s) — broadcasting locally only",
+                    channel,
+                    exc,
+                )
+        await self._deliver_local(channel, encoded)
+
+    async def _deliver_local(self, channel: str, encoded_text: str) -> None:
+        for connection in list(self._ws_channels.get(channel, ())):
+            try:
+                await connection.send_text(encoded_text)
+            except Exception:
+                # A dead/dropped connection shouldn't stop delivery to
+                # every OTHER subscriber on this channel — its own
+                # disconnect handling (_dispatch_websocket's finally
+                # block) is what actually removes it from this set; this
+                # is just one failed send along the way, not fatal to the
+                # broadcast as a whole.
+                _logger.debug(
+                    "failed to deliver a WS broadcast on channel %r", channel, exc_info=True
+                )
+
+    async def _pump_redix_channel(self, channel: str, redix: Any) -> None:
+        """Runs for as long as `channel` has at least one local subscriber
+        — one such task per channel, started by _ws_subscribe below on the
+        first subscribe() and cancelled by _ws_unsubscribe once the last
+        local subscriber leaves. Every message this worker's own
+        broadcast() publishes to `channel` comes back through here too
+        (see broadcast()'s own docstring), so _deliver_local is the ONE
+        place a message actually reaches a connection's send_text."""
+        try:
+            pubsub = await redix.subscribe(channel)
+            async for msg in pubsub.listen():
+                if msg.get("type") != "message":
+                    continue
+                data = msg["data"]
+                text = data.decode("utf-8") if isinstance(data, bytes) else data
+                await self._deliver_local(channel, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception("redix pub/sub listener for WS channel %r died", channel)
+
+    async def _ws_subscribe(self, connection: WebSocketConnection, channel: str) -> None:
+        connections = self._ws_channels.setdefault(channel, set())
+        is_first_local_subscriber = len(connections) == 0
+        connections.add(connection)
+        if is_first_local_subscriber:
+            redix = self._kernel.get("redix") if self._kernel.has("redix") else None
+            if redix is not None:
+                self._ws_redix_tasks[channel] = asyncio.create_task(
+                    self._pump_redix_channel(channel, redix)
+                )
+
+    async def _ws_unsubscribe(self, connection: WebSocketConnection, channel: str) -> None:
+        connections = self._ws_channels.get(channel)
+        if connections is None:
+            return
+        connections.discard(connection)
+        if not connections:
+            del self._ws_channels[channel]
+            task = self._ws_redix_tasks.pop(channel, None)
+            if task is not None:
+                task.cancel()
+
     def mount_spa(self, dist_dir: str | Path, prefix: str) -> None:
         """Serve a pre-built SPA (e.g. a plugin's own `ui/dist/`) under
         `/<prefix>/*`, falling back to `<dist_dir>/index.html` for any
@@ -290,6 +444,15 @@ class GatewayProvider:
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         if scope["type"] == "lifespan":
             return await self._handle_lifespan(receive, send)
+        if scope["type"] == "websocket":
+            # Bypassed entirely around the HTTP middleware chain, not
+            # threaded through it — every middleware in middleware.py
+            # already no-ops on a non-"http" scope, so routing a websocket
+            # scope through all seven of them first would just be seven
+            # wasted no-op calls. _dispatch_websocket resolves request_id/
+            # client_ip/identity itself, the same way each middleware
+            # does, at the one point that actually needs them.
+            return await self._dispatch_websocket(scope, receive, send)
         app = self._compiled_app()
         await app(scope, receive, send)
 
@@ -427,6 +590,111 @@ class GatewayProvider:
                 )
         else:
             await send_json(send, 200, result)
+
+    async def _dispatch_websocket(self, scope: dict, receive: Callable, send: Callable) -> None:
+        """Handshake -> roles/origin check -> handler, in that order —
+        deliberately never accept() before both checks pass (see
+        websocket.py's POLICY_VIOLATION and add_ws_route's own docstring):
+        a rejected connection should never complete the WS upgrade at
+        all, matching how relay's whitelist() checks roles before it ever
+        touches a request body.
+
+        Identity/client_ip/request_id are resolved here directly, not via
+        the HTTP middleware chain (__call__ routes a websocket scope
+        around it entirely) — same underlying functions
+        identity_middleware/resolve_client_ip/new_request_id use for an
+        ordinary HTTP request, just called once, at the one point in a
+        WS connection's life that needs them, rather than per-message."""
+        connect_event = await receive()
+        if connect_event.get("type") != "websocket.connect":
+            # Not a real deviation any spec-compliant ASGI server would
+            # actually produce — defensive, not an expected path.
+            return
+
+        path = scope["path"]
+        match = self._router.match(WEBSOCKET_METHOD, path)
+        route = match.route
+
+        async def reject(code: int) -> None:
+            await send({"type": "websocket.close", "code": code})
+
+        if route is None:
+            await reject(1000)
+            return
+
+        # WS-equivalent of CSRF: browsers don't enforce same-origin on a
+        # WebSocket upgrade the way they do on fetch/XHR, so a page on
+        # another origin could open a connection here riding the victim's
+        # own session cookie unless the server checks Origin itself.
+        # Reuses gateway_cors_origins rather than a second setting — the
+        # same trusted-origins list already governs cross-origin access
+        # to this app either way.
+        origin = get_header(scope, b"origin")
+        if self._cors_origins and origin is not None:
+            origin_str = origin.decode("latin-1")
+            if "*" not in self._cors_origins and origin_str not in self._cors_origins:
+                await reject(POLICY_VIOLATION)
+                return
+
+        authn_provider = self._kernel.get("authn") if self._kernel.has("authn") else None
+        resolve = getattr(authn_provider, "resolve_identity", None)
+        try:
+            identity = await resolve(scope) if callable(resolve) else None
+        except Exception:
+            # Same "fail closed to unauthenticated, log server-side"
+            # posture identity_middleware's own docstring documents at
+            # length for the identical failure — an infrastructure error
+            # inside resolve_identity must not crash the handshake.
+            _logger.exception(
+                "identity resolution raised during a WS handshake — treating as unauthenticated"
+            )
+            identity = None
+
+        # Same three-branch authorization relay.whitelist()'s own
+        # _wire_gateway_route uses (relay/__init__.py) — not a
+        # WS-specific reinterpretation of "*"/"Guest", the identical
+        # meaning on both transports.
+        caller_roles = set(getattr(identity, "roles", None) or [])
+        if "*" in route.roles:
+            authorized = identity is not None
+        elif "*" in caller_roles:
+            authorized = True
+        else:
+            authorized = bool((caller_roles | {"Guest"}) & route.roles)
+        if not authorized:
+            await reject(POLICY_VIOLATION)
+            return
+
+        client_ip = resolve_client_ip(
+            scope,
+            trusted_proxies=set(self._trusted_proxies),
+            forwarded_header=self._forwarded_header.encode("latin-1").lower(),
+        )
+
+        connection = WebSocketConnection(
+            scope,
+            receive,
+            send,
+            identity=identity,
+            client_ip=client_ip,
+            request_id=new_request_id(),
+            path_params=match.params,
+            subscribe=self._ws_subscribe,
+            unsubscribe=self._ws_unsubscribe,
+        )
+        try:
+            await route.handler(connection)
+        except Exception:
+            # Same "never let it escape unstructured to Granian" posture
+            # _dispatch's own catch-all uses for an HTTP handler — a
+            # WebSocket has no status code to report a 500 with at this
+            # point (the handshake, if not the whole conversation, has
+            # long since succeeded), so the best available signal is an
+            # abnormal close code plus a server-side traceback.
+            _logger.exception("unhandled exception in WS handler for %s", path)
+            await connection.close(1011)  # 1011 Internal Error
+        finally:
+            await connection.close()
 
     async def _try_serve_spa(self, path: str) -> tuple[bytes, str, str] | None:
         """Returns (body, content_type, cache_control) if `path` falls under
