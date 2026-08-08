@@ -298,12 +298,25 @@ def resolve_client_ip(
     Walks the forwarded header from the RIGHTMOST entry (nearest hop)
     inward. Each hop must be in trusted_proxies to keep walking past it;
     the first untrusted hop found is the real client IP. Never trusts the
-    leftmost entry directly — a client can put anything it wants there."""
+    leftmost entry directly — a client can put anything it wants there.
+
+    The header is only ever consulted when the RAW, DIRECTLY-connected
+    peer is itself a trusted proxy. A reverse proxy configured with
+    $proxy_add_x_forwarded_for (arc deploy prod's own nginx template)
+    APPENDS its own truthful observation to whatever X-Forwarded-For it
+    received — it never discards a client-supplied one — so the header
+    only carries any honest information at all once a trusted hop has
+    actually touched it. A caller connecting straight to gateway,
+    bypassing the proxy entirely, can hand it any X-Forwarded-For chain
+    it likes; trusting that would let a direct connection spoof its way
+    past allowed_ips, rate limiting, and every audit log built on
+    client_ip — trusted_proxies naming the PROXY is meaningless if
+    gateway never checks that the proxy is who's actually talking to it."""
     peer = scope.get("client")
     fallback_ip = peer[0] if peer else None
     ip = fallback_ip
 
-    if trusted_proxies:
+    if trusted_proxies and fallback_ip in trusted_proxies:
         header = get_header(scope, forwarded_header)
         if header is not None:
             hops = [h.strip() for h in header.decode("latin-1").split(",") if h.strip()]
