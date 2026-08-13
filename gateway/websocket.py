@@ -43,6 +43,13 @@ POLICY_VIOLATION = 1008
 # retry (see arc-gateway-websocket.MD §8's own client example).
 RATE_LIMITED = 4029
 
+# Same "echo the HTTP status numerically into the 4000-4999 private-use
+# range" convention as RATE_LIMITED above, for maintenance mode's HTTP 503
+# — a well-behaved client's default reconnect-with-backoff for an
+# unexpected close is the right response here too (the server is
+# temporarily down, not permanently refusing this client).
+MAINTENANCE = 4503
+
 
 class WebSocketDisconnect(Exception):
     """Raised out of receive_raw()/receive_json()/iter_json() the moment

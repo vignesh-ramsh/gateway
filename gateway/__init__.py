@@ -49,6 +49,7 @@ from .middleware import (
     resolve_client_ip,
     security_headers_middleware,
 )
+from .error_pages import send_error
 from .openapi import build_openapi_spec
 from .request import (
     HTTPError,
@@ -66,7 +67,7 @@ from .request import (
     send_stream,
 )
 from .router import WEBSOCKET_METHOD, Router, RouterError
-from .websocket import POLICY_VIOLATION, RATE_LIMITED, WebSocketConnection
+from .websocket import MAINTENANCE, POLICY_VIOLATION, RATE_LIMITED, WebSocketConnection
 
 CAPABILITY = "gateway"
 
@@ -82,6 +83,8 @@ DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB — generous for a JSON API b
 RATE_LIMIT_ENABLED_KEY = "gateway_rate_limit_enabled"
 RATE_LIMIT_REQUESTS_KEY = "gateway_rate_limit_requests"
 RATE_LIMIT_WINDOW_SECONDS_KEY = "gateway_rate_limit_window_seconds"
+
+MAINTENANCE_MODE_KEY = "gateway_maintenance_mode"
 # 300 req/60s (5/sec sustained) — generous enough that normal admin-console
 # usage (a page load firing several requests near-simultaneously, infinite
 # scroll, debounced search/sort) never approaches it; only sustained
@@ -482,6 +485,27 @@ class GatewayProvider:
         method = scope["method"]
         path = scope["path"]
 
+        # Read fresh every request, deliberately NOT baked into __init__
+        # like every other setting on this class — a toggle only a
+        # restarted process would ever see defeats the point of an
+        # operational on/off switch a human flips during a live incident
+        # or deploy. Cheap: SettingsManager's own TOML read is cached by
+        # (mtime, size) and only re-parses when `arc set-maintenance` (a
+        # separate process) has actually changed the file, so this costs
+        # one stat() call on every other request. Checked before routing,
+        # SPA serving, or auth — a site under maintenance shows the same
+        # page for every path and every caller, not just the ones that
+        # would otherwise have resolved to a real route.
+        if self._kernel.settings.get(MAINTENANCE_MODE_KEY):
+            await send_error(
+                send,
+                scope,
+                503,
+                {"error": "service unavailable", "reason": "maintenance"},
+                extra_headers={"Retry-After": "120"},
+            )
+            return
+
         if method == "GET" and self._spa_mounts:
             spa_hit = await self._try_serve_spa(path)
             if spa_hit is not None:
@@ -498,7 +522,7 @@ class GatewayProvider:
         match = self._router.match(method, path)
 
         if match.route is None and not match.allowed_methods:
-            await send_json(send, 404, {"error": "not found", "path": path})
+            await send_error(send, scope, 404, {"error": "not found", "path": path})
             return
         if match.route is None:
             await send_json(
@@ -513,7 +537,7 @@ class GatewayProvider:
         try:
             body = await read_body(receive, max_bytes=route.max_body_bytes or self._max_body_bytes)
         except HTTPError as exc:
-            await send_json(send, exc.status_code, exc.detail)
+            await send_error(send, scope, exc.status_code, exc.detail)
             return
 
         request = Request(
@@ -540,7 +564,7 @@ class GatewayProvider:
         try:
             result = await route.handler(request)
         except HTTPError as exc:
-            await send_json(send, exc.status_code, exc.detail)
+            await send_error(send, scope, exc.status_code, exc.detail)
             return
         except Exception as exc:
             # Anything else is a genuine bug, not a client mistake — log the
@@ -628,6 +652,16 @@ class GatewayProvider:
 
         async def reject(code: int) -> None:
             await send({"type": "websocket.close", "code": code})
+
+        # Same live-read maintenance-mode check _dispatch does for HTTP —
+        # see its own comment for why this is read fresh rather than baked
+        # in at construction time. Checked before the roles/origin checks
+        # below (and even before "route is None"): a site under
+        # maintenance rejects every upgrade attempt uniformly, not just
+        # ones that would otherwise have resolved to a real route.
+        if self._kernel.settings.get(MAINTENANCE_MODE_KEY):
+            await reject(MAINTENANCE)
+            return
 
         if route is None:
             await reject(1000)
@@ -919,6 +953,18 @@ def register(kernel: Any) -> None:
         type=int,
         default=DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
         doc="Rate-limit window length, in seconds.",
+    )
+    kernel.settings.declare(
+        MAINTENANCE_MODE_KEY,
+        type=bool,
+        default=False,
+        # Deliberately NOT read here and baked into GatewayProvider.__init__
+        # like every setting above — see _dispatch's own comment. Toggle it
+        # with `arc set-maintenance on|off`, not by hand-editing arc.toml
+        # (works either way; the CLI command is just the documented path).
+        doc="While on, every request gets a 503 (maintenance page to a "
+        "browser, JSON to an API client) instead of routing normally. "
+        "Read fresh per request — takes effect immediately, no restart.",
     )
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
