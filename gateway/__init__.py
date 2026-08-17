@@ -601,12 +601,26 @@ class GatewayProvider:
             return
 
         if isinstance(result, Response):
+            # Cache-Control: no-store by default on every route-handler
+            # response (never on the SPA-serving branch above, which
+            # returns before reaching here, and deliberately sets its own
+            # real Cache-Control) — a route that genuinely wants caching
+            # can still set its own Cache-Control in result.headers, which
+            # wins here since it's applied AFTER this default. Without
+            # this, a browser's default fetch() cache mode can silently
+            # serve a stale GET response for a whitelisted function (a
+            # live, per-request computation, e.g. a connectivity check or
+            # just-changed settings) instead of hitting the server again —
+            # found exactly this way: ClamAV status and a just-saved
+            # settings toggle both appeared "stuck" after a page refresh,
+            # even though the backend was already correct and live.
+            headers = {"Cache-Control": "no-store", **result.headers}
             if result.media_type == "application/json":
                 await send_json(
                     send,
                     result.status_code,
                     result.content,
-                    extra_headers=result.headers,
+                    extra_headers=headers,
                     cookies=result.cookies,
                 )
             else:
@@ -620,11 +634,16 @@ class GatewayProvider:
                     result.status_code,
                     body,
                     content_type=result.media_type,
-                    extra_headers=result.headers,
+                    extra_headers=headers,
                     cookies=result.cookies,
                 )
         else:
-            await send_json(send, 200, result)
+            # Same default as above — this is the common case for a
+            # whitelisted function that just returns a plain dict/list
+            # (no Response object of its own), e.g. every example in this
+            # session's own investigation (list_filer_settings,
+            # get_filer_antivirus_status).
+            await send_json(send, 200, result, extra_headers={"Cache-Control": "no-store"})
 
     async def _dispatch_websocket(self, scope: dict, receive: Callable, send: Callable) -> None:
         """Handshake -> roles/origin check -> handler, in that order —
