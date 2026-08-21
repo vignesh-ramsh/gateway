@@ -30,6 +30,7 @@ import logging
 import mimetypes
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 import arc
 
@@ -693,10 +694,29 @@ class GatewayProvider:
         # Reuses gateway_cors_origins rather than a second setting — the
         # same trusted-origins list already governs cross-origin access
         # to this app either way.
+        #
+        # An EMPTY gateway_cors_origins must mean "no cross-origin allowed"
+        # here, unlike cors_middleware's own HTTP-side no-op for that same
+        # empty case (that middleware's job is only ever to ADD a
+        # permissive header on top of the browser's own same-origin
+        # default for fetch/XHR — with nothing configured there is
+        # nothing to add, and SOP itself still protects the request). A
+        # WS upgrade has no SOP protecting it at all, so "nothing
+        # configured" has to fall back to an explicit same-origin check
+        # against Host instead of falling through open — the empty
+        # default previously skipped this whole block, letting ANY origin
+        # ride the victim's session cookie into an authenticated socket.
         origin = get_header(scope, b"origin")
-        if self._cors_origins and origin is not None:
+        if origin is not None:
             origin_str = origin.decode("latin-1")
-            if "*" not in self._cors_origins and origin_str not in self._cors_origins:
+            if self._cors_origins:
+                allowed = "*" in self._cors_origins or origin_str in self._cors_origins
+            else:
+                host = get_header(scope, b"host")
+                allowed = host is not None and urlsplit(origin_str).netloc == host.decode(
+                    "latin-1"
+                )
+            if not allowed:
                 await reject(POLICY_VIOLATION)
                 return
 
