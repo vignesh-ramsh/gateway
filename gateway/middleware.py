@@ -198,6 +198,15 @@ def cors_middleware(allowed_origins: list[str] | None) -> Middleware:
                 and get_header(scope, b"access-control-request-method") is not None
             )
 
+            # The Access-Control-Allow-Origin value below VARIES by request
+            # (it echoes the caller's own Origin) whenever the allowlist
+            # isn't the literal wildcard — without Vary: Origin, a shared
+            # cache in front of this app (a CDN, a corporate proxy) is free
+            # to store one origin's response, ACAO header included, and
+            # replay it to a DIFFERENT origin's request. "*" needs no such
+            # header: that response is identical for every origin already.
+            vary_by_origin = allow and "*" not in origins
+
             if is_preflight:
                 headers = []
                 if allow:
@@ -209,6 +218,8 @@ def cors_middleware(allowed_origins: list[str] | None) -> Middleware:
                     if req_headers:
                         headers.append((b"access-control-allow-headers", req_headers))
                     headers.append((b"access-control-max-age", b"600"))
+                if vary_by_origin:
+                    headers.append((b"vary", b"Origin"))
                 await send({"type": "http.response.start", "status": 204, "headers": headers})
                 await send({"type": "http.response.body", "body": b""})
                 return
@@ -217,6 +228,8 @@ def cors_middleware(allowed_origins: list[str] | None) -> Middleware:
                 if message["type"] == "http.response.start" and allow:
                     headers = list(message.get("headers", []))
                     headers.append((b"access-control-allow-origin", allow_origin_value))
+                    if vary_by_origin:
+                        headers.append((b"vary", b"Origin"))
                     message = {**message, "headers": headers}
                 await send(message)
 
