@@ -80,12 +80,24 @@ def parse_multipart_form(body: bytes, content_type: str) -> MultipartForm:
     return form
 
 
+# RFC 2046 §5.1.1 caps the boundary parameter at 70 characters. An empty
+# boundary (`boundary=`) makes the delimiter just `b"--"`, which then
+# matches every literal "--" inside the body instead of the real part
+# separator — split() on that produces a spurious part per occurrence
+# rather than a parse error, so it must be rejected explicitly rather
+# than left to fail some other way downstream. An oversized boundary is
+# never something a real client sends; only worth bounding defensively.
+_MAX_BOUNDARY_LENGTH = 70
+
+
 def _extract_boundary(content_type: str) -> bytes:
     if "boundary=" not in content_type:
         raise HTTPError(400, {"error": "missing multipart boundary"})
     boundary = content_type.split("boundary=", 1)[1].split(";", 1)[0].strip()
     if boundary.startswith('"') and boundary.endswith('"'):
         boundary = boundary[1:-1]
+    if not boundary or len(boundary) > _MAX_BOUNDARY_LENGTH:
+        raise HTTPError(400, {"error": "invalid multipart boundary"})
     return boundary.encode("latin-1")
 
 
