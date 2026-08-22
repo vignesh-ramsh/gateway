@@ -588,6 +588,28 @@ class GatewayProvider:
         self._built_app = app
         return app
 
+    async def _send_unhandled_exception(
+        self, send: Callable, scope: dict, exc: Exception, method: str, path: str
+    ) -> None:
+        """The single place _dispatch sends a 500 for a genuine bug rather
+        than a client mistake — always logged server-side, in full,
+        regardless of what (if anything) also goes back in the response.
+        Whether the RESPONSE itself carries real detail depends on the
+        caller: see _caller_gets_debug_detail's own docstring — an
+        anonymous or ordinary-role caller gets the same generic message
+        this always returned; an authenticated caller matching
+        gateway_debug_roles (any real identity, by default) gets the
+        exception type/message/traceback instead, with known secrets
+        redacted and file paths shortened to the project root first."""
+        _logger.exception("unhandled exception in %s %s", method, path)
+        identity = scope.get("state", {}).get("arc_identity")
+        if _caller_gets_debug_detail(self._kernel, identity):
+            raw = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+            detail = _redact_known_secrets(_shorten_project_paths(raw, self._kernel), self._kernel)
+            await send_json(send, 500, {"error": "internal server error", "detail": detail})
+        else:
+            await send_json(send, 500, {"error": "internal server error"})
+
     async def _dispatch(self, scope: dict, receive: Callable, send: Callable) -> None:
         method = scope["method"]
         path = scope["path"]
@@ -674,27 +696,7 @@ class GatewayProvider:
             await send_error(send, scope, exc.status_code, exc.detail)
             return
         except Exception as exc:
-            # Anything else is a genuine bug, not a client mistake — always
-            # logged server-side, in full, regardless of what (if anything)
-            # also goes back in the response. Whether the RESPONSE itself
-            # carries real detail depends on the caller: see
-            # _caller_gets_debug_detail's own docstring — an anonymous or
-            # ordinary-role caller gets the same generic message this
-            # always returned; an authenticated caller matching
-            # gateway_debug_roles (any real identity, by default) gets the
-            # exception type/message/traceback instead, so the common "I
-            # just broke my own new endpoint" case doesn't require tailing
-            # server logs — with known secrets redacted first either way.
-            _logger.exception("unhandled exception in %s %s", method, path)
-            identity = scope.get("state", {}).get("arc_identity")
-            if _caller_gets_debug_detail(self._kernel, identity):
-                raw = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
-                detail = _redact_known_secrets(
-                    _shorten_project_paths(raw, self._kernel), self._kernel
-                )
-                await send_json(send, 500, {"error": "internal server error", "detail": detail})
-            else:
-                await send_json(send, 500, {"error": "internal server error"})
+            await self._send_unhandled_exception(send, scope, exc, method, path)
             return
 
         if isinstance(result, StreamResponse):
@@ -721,50 +723,72 @@ class GatewayProvider:
                     pass
             return
 
-        if isinstance(result, Response):
-            # Cache-Control: no-store by default on every route-handler
-            # response (never on the SPA-serving branch above, which
-            # returns before reaching here, and deliberately sets its own
-            # real Cache-Control) — a route that genuinely wants caching
-            # can still set its own Cache-Control in result.headers, which
-            # wins here since it's applied AFTER this default. Without
-            # this, a browser's default fetch() cache mode can silently
-            # serve a stale GET response for a whitelisted function (a
-            # live, per-request computation, e.g. a connectivity check or
-            # just-changed settings) instead of hitting the server again —
-            # found exactly this way: ClamAV status and a just-saved
-            # settings toggle both appeared "stuck" after a page refresh,
-            # even though the backend was already correct and live.
-            headers = {"Cache-Control": "no-store", **result.headers}
-            if result.media_type == "application/json":
-                await send_json(
-                    send,
-                    result.status_code,
-                    result.content,
-                    extra_headers=headers,
-                    cookies=result.cookies,
-                )
+        try:
+            if isinstance(result, Response):
+                # Cache-Control: no-store by default on every route-handler
+                # response (never on the SPA-serving branch above, which
+                # returns before reaching here, and deliberately sets its own
+                # real Cache-Control) — a route that genuinely wants caching
+                # can still set its own Cache-Control in result.headers, which
+                # wins here since it's applied AFTER this default. Without
+                # this, a browser's default fetch() cache mode can silently
+                # serve a stale GET response for a whitelisted function (a
+                # live, per-request computation, e.g. a connectivity check or
+                # just-changed settings) instead of hitting the server again —
+                # found exactly this way: ClamAV status and a just-saved
+                # settings toggle both appeared "stuck" after a page refresh,
+                # even though the backend was already correct and live.
+                headers = {"Cache-Control": "no-store", **result.headers}
+                if result.media_type == "application/json":
+                    await send_json(
+                        send,
+                        result.status_code,
+                        result.content,
+                        extra_headers=headers,
+                        cookies=result.cookies,
+                    )
+                else:
+                    body = (
+                        result.content
+                        if isinstance(result.content, bytes)
+                        else str(result.content).encode("utf-8")
+                    )
+                    await send_bytes(
+                        send,
+                        result.status_code,
+                        body,
+                        content_type=result.media_type,
+                        extra_headers=headers,
+                        cookies=result.cookies,
+                    )
             else:
-                body = (
-                    result.content
-                    if isinstance(result.content, bytes)
-                    else str(result.content).encode("utf-8")
-                )
-                await send_bytes(
-                    send,
-                    result.status_code,
-                    body,
-                    content_type=result.media_type,
-                    extra_headers=headers,
-                    cookies=result.cookies,
-                )
-        else:
-            # Same default as above — this is the common case for a
-            # whitelisted function that just returns a plain dict/list
-            # (no Response object of its own), e.g. every example in this
-            # session's own investigation (list_filer_settings,
-            # get_filer_antivirus_status).
-            await send_json(send, 200, result, extra_headers={"Cache-Control": "no-store"})
+                # Same default as above — this is the common case for a
+                # whitelisted function that just returns a plain dict/list
+                # (no Response object of its own), e.g. every example in this
+                # session's own investigation (list_filer_settings,
+                # get_filer_antivirus_status).
+                await send_json(send, 200, result, extra_headers={"Cache-Control": "no-store"})
+        except Exception as exc:
+            # A handler can return successfully and STILL fail here — e.g.
+            # a return value encode_json can't serialize (an un-awaited
+            # coroutine from a missing `await` is the single most common
+            # real case: the handler itself never raises, so this is the
+            # ONLY place that failure is ever observable at all). Before
+            # this, that TypeError propagated straight out of _dispatch
+            # uncaught — past every ASGI middleware, past access_log's own
+            # send() wrapper (which is why a request like this shows
+            # status=0 in the access log: it never saw a real
+            # http.response.start), landing wherever Granian's own
+            # top-level error handling sends it, with no coherent HTTP
+            # response at all. Only safe to attempt here because
+            # encode_json runs BEFORE send_bytes's own first `send()` call
+            # in every path above — nothing has gone out on the wire yet
+            # for the ordinary "bad return value" case this is actually
+            # for; a failure from deeper inside an already-started send
+            # (a broken client connection, not a serialization bug) can
+            # still raise a second time out of this handler, same as
+            # before this existed.
+            await self._send_unhandled_exception(send, scope, exc, method, path)
 
     async def _dispatch_websocket(self, scope: dict, receive: Callable, send: Callable) -> None:
         """Handshake -> roles/origin check -> handler, in that order —
