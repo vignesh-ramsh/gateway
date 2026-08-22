@@ -137,6 +137,26 @@ _logger = logging.getLogger("gateway")
 _MIN_REDACTABLE_SECRET_LENGTH = 8
 
 
+def _shorten_project_paths(text: str, kernel: Any) -> str:
+    """Strips the project root off every absolute path in `text` — a
+    traceback frame reads `File "/home/user/.../plugins/gateway/gateway/
+    __init__.py", line N` otherwise, which is both noisy and leaks the
+    local machine's own username/directory layout for no benefit (the
+    caller who's even allowed to see this detail already knows which
+    project they're running). `kernel.project_root` is set at `arc.boot()`
+    time to wherever THIS deployment actually lives, so this has no
+    hardcoded path of its own — "plugins/gateway/gateway/__init__.py" is
+    just whatever falls out of stripping that prefix, same for every
+    deployment regardless of where it's checked out."""
+    root = getattr(kernel, "project_root", None)
+    if root is None:
+        return text
+    root_str = str(root)
+    if not root_str.endswith("/"):
+        root_str += "/"
+    return text.replace(root_str, "")
+
+
 def _redact_known_secrets(text: str, kernel: Any) -> str:
     """Replaces any exact occurrence of a currently-declared secret
     SETTING's real value (signing keys, DSNs, API tokens — anything this
@@ -668,8 +688,9 @@ class GatewayProvider:
             _logger.exception("unhandled exception in %s %s", method, path)
             identity = scope.get("state", {}).get("arc_identity")
             if _caller_gets_debug_detail(self._kernel, identity):
+                raw = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
                 detail = _redact_known_secrets(
-                    f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}", self._kernel
+                    _shorten_project_paths(raw, self._kernel), self._kernel
                 )
                 await send_json(send, 500, {"error": "internal server error", "detail": detail})
             else:
