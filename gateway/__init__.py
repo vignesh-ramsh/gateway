@@ -81,9 +81,11 @@ CSP_REPORT_ONLY_KEY = "gateway_csp_report_only"
 # reflected XSS via filer-served, user-uploaded bytes on the same origin as
 # the admin SPA (the audit finding this closes). frame-ancestors 'self'
 # matches x-frame-options' own SAMEORIGIN default rather than tightening
-# past it. Sent Report-Only by default (CSP_REPORT_ONLY_KEY) since a script-
-# src this strict would currently block authn's own /impersonate inline
-# <script> — see security_headers_middleware's own docstring.
+# past it. Sent Report-Only by default (CSP_REPORT_ONLY_KEY) since a script-src
+# this strict would currently block wschat's demo chat page, which
+# still embeds an inline <script> — see security_headers_middleware's
+# own docstring for the full reasoning, and why authn's /impersonate
+# page no longer needs this exception.
 DEFAULT_CSP = (
     "default-src 'self'; object-src 'none'; base-uri 'self'; "
     "frame-ancestors 'self'; form-action 'self'"

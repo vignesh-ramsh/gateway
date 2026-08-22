@@ -155,12 +155,17 @@ def security_headers_middleware(
     `csp` (`gateway_csp` setting) is sent Report-Only by default
     (`csp_report_only`, `gateway_csp_report_only`, defaults True) — a real
     policy strict enough to matter (no blanket 'unsafe-inline') would
-    currently break authn's own `/impersonate` page, which embeds a small
-    inline `<script>` with no bundle to load it from (see
-    auth_api.py's `_impersonate_html`). Report-Only observes real violations
-    in production without breaking that page, and gives an operator that's
-    confirmed a policy is safe (or fixed the inline-script case) a single
-    setting to flip to enforcing."""
+    currently break wschat's own demo chat page, which still embeds an
+    inline `<script>` (see api/chat.py's `_CHAT_HTML`; already documented
+    as demo-only/not-production-safe, but still a real page that would
+    stop working). authn's own `/impersonate` page used to be the same
+    story — fixed by moving its script to a static, same-origin
+    impersonate.js (auth_api.py) instead of embedding one inline, which is
+    the template to follow for wschat's page too, if it's ever meant to
+    survive an enforcing CSP. Report-Only observes real violations in
+    production without breaking what's left, and gives an operator that's
+    confirmed a policy is safe (or fixed the remaining inline-script case)
+    a single setting to flip to enforcing."""
 
     def middleware(app: ASGIApp) -> ASGIApp:
         async def wrapped(scope, receive, send):
