@@ -130,24 +130,37 @@ def request_id_middleware() -> Middleware:
     return middleware
 
 
-def security_headers_middleware(*, hsts: bool = False) -> Middleware:
+def security_headers_middleware(
+    *, hsts: bool = False, csp: str | None = None, csp_report_only: bool = True
+) -> Middleware:
     """Baseline headers on every response. HSTS only if the app is confident
     it's served over TLS (`gateway_force_https` setting) — sending it over
     plain HTTP is actively harmful (it forces HTTPS on future visits).
 
-    `X-Frame-Options: DENY` is the default, but only ever ADDED — never
-    appended on top of one the handler already set. Without that check, a
-    handler returning its own `X-Frame-Options` (e.g. filer's serve_file,
-    which sets SAMEORIGIN so a PDF can render in this app's own preview
-    `<iframe>`) would end up with BOTH values on the wire; browsers treat
-    duplicate X-Frame-Options headers as the most restrictive one wins,
-    so the handler's own choice would be silently overridden by DENY no
-    matter what it asked for — confirmed directly against a real PDF
-    upload: the file served fine (200, correct bytes, correct
-    content-type) but never rendered in the preview iframe, purely
-    because of this unconditional append. Same reasoning would apply to
-    x-content-type-options, but nosniff has no legitimate reason for any
-    route to ever want it disabled, so that one stays unconditional."""
+    Every header here is only ever ADDED — never appended on top of one the
+    handler already set. Without that check, a handler returning its own
+    `X-Frame-Options` (e.g. filer's serve_file, which sets SAMEORIGIN so a
+    PDF can render in this app's own preview `<iframe>`) would end up with
+    BOTH values on the wire; browsers treat duplicate X-Frame-Options
+    headers as the most restrictive one wins, so the handler's own choice
+    would be silently overridden by DENY no matter what it asked for —
+    confirmed directly against a real PDF upload: the file served fine
+    (200, correct bytes, correct content-type) but never rendered in the
+    preview iframe, purely because of this unconditional append.
+    x-content-type-options has no real handler-side counterpart today (no
+    route sets its own), but it's guarded the same way on the same
+    principle: a baseline middleware should never assume it's the only
+    thing with an opinion on a given header.
+
+    `csp` (`gateway_csp` setting) is sent Report-Only by default
+    (`csp_report_only`, `gateway_csp_report_only`, defaults True) — a real
+    policy strict enough to matter (no blanket 'unsafe-inline') would
+    currently break authn's own `/impersonate` page, which embeds a small
+    inline `<script>` with no bundle to load it from (see
+    auth_api.py's `_impersonate_html`). Report-Only observes real violations
+    in production without breaking that page, and gives an operator that's
+    confirmed a policy is safe (or fixed the inline-script case) a single
+    setting to flip to enforcing."""
 
     def middleware(app: ASGIApp) -> ASGIApp:
         async def wrapped(scope, receive, send):
@@ -157,13 +170,23 @@ def security_headers_middleware(*, hsts: bool = False) -> Middleware:
             async def send_wrapper(message):
                 if message["type"] == "http.response.start":
                     headers = list(message.get("headers", []))
-                    headers.append((b"x-content-type-options", b"nosniff"))
-                    if not any(k.lower() == b"x-frame-options" for k, _ in headers):
+                    existing = {k.lower() for k, _ in headers}
+                    if b"x-content-type-options" not in existing:
+                        headers.append((b"x-content-type-options", b"nosniff"))
+                    if b"x-frame-options" not in existing:
                         headers.append((b"x-frame-options", b"DENY"))
-                    if hsts:
+                    if hsts and b"strict-transport-security" not in existing:
                         headers.append(
                             (b"strict-transport-security", b"max-age=63072000; includeSubDomains")
                         )
+                    if csp:
+                        csp_header = (
+                            b"content-security-policy-report-only"
+                            if csp_report_only
+                            else b"content-security-policy"
+                        )
+                        if csp_header not in existing:
+                            headers.append((csp_header, csp.encode("latin-1")))
                     message = {**message, "headers": headers}
                 await send(message)
 

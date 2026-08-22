@@ -75,6 +75,19 @@ CAPABILITY = "gateway"
 CORS_ORIGINS_KEY = "gateway_cors_origins"
 CSRF_ENABLED_KEY = "gateway_csrf_enabled"
 FORCE_HTTPS_KEY = "gateway_force_https"
+CSP_KEY = "gateway_csp"
+CSP_REPORT_ONLY_KEY = "gateway_csp_report_only"
+# No 'unsafe-inline' — deliberately real enough to matter against a stored/
+# reflected XSS via filer-served, user-uploaded bytes on the same origin as
+# the admin SPA (the audit finding this closes). frame-ancestors 'self'
+# matches x-frame-options' own SAMEORIGIN default rather than tightening
+# past it. Sent Report-Only by default (CSP_REPORT_ONLY_KEY) since a script-
+# src this strict would currently block authn's own /impersonate inline
+# <script> — see security_headers_middleware's own docstring.
+DEFAULT_CSP = (
+    "default-src 'self'; object-src 'none'; base-uri 'self'; "
+    "frame-ancestors 'self'; form-action 'self'"
+)
 TRUSTED_PROXIES_KEY = "gateway_trusted_proxies"
 FORWARDED_HEADER_KEY = "gateway_forwarded_header"
 MAX_BODY_BYTES_KEY = "gateway_max_body_bytes"
@@ -108,6 +121,8 @@ class GatewayProvider:
         cors_origins: list[str] | None = None,
         csrf_enabled: bool = False,
         hsts: bool = False,
+        csp: str | None = None,
+        csp_report_only: bool = True,
         trusted_proxies: list[str] | None = None,
         forwarded_header: str = "X-Forwarded-For",
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
@@ -167,7 +182,7 @@ class GatewayProvider:
         # before ever reaching it.
         self._builtin_middlewares: list[Callable[[ASGIApp], ASGIApp]] = [
             request_id_middleware(),
-            security_headers_middleware(hsts=hsts),
+            security_headers_middleware(hsts=hsts, csp=csp, csp_report_only=csp_report_only),
             cors_middleware(cors_origins),
             csrf_middleware(kernel, enabled=csrf_enabled),
             self._build_client_ip_middleware(),
@@ -956,6 +971,18 @@ def register(kernel: Any) -> None:
         doc="Send Strict-Transport-Security — only enable once served over TLS.",
     )
     kernel.settings.declare(
+        CSP_KEY,
+        default=DEFAULT_CSP,
+        doc="Content-Security-Policy value. Empty disables it entirely.",
+    )
+    kernel.settings.declare(
+        CSP_REPORT_ONLY_KEY,
+        type=bool,
+        default=True,
+        doc="Send CSP as Content-Security-Policy-Report-Only instead of "
+        "enforcing it. See DEFAULT_CSP's own comment for why this defaults on.",
+    )
+    kernel.settings.declare(
         TRUSTED_PROXIES_KEY,
         doc="Comma-separated trusted reverse-proxy IPs, for X-Forwarded-For parsing.",
     )
@@ -1018,6 +1045,8 @@ def register(kernel: Any) -> None:
         cors_origins=cors_origins,
         csrf_enabled=kernel.settings.get(CSRF_ENABLED_KEY),
         hsts=kernel.settings.get(FORCE_HTTPS_KEY),
+        csp=kernel.settings.get(CSP_KEY),
+        csp_report_only=kernel.settings.get(CSP_REPORT_ONLY_KEY),
         trusted_proxies=trusted_proxies,
         forwarded_header=kernel.settings.get(FORWARDED_HEADER_KEY),
         max_body_bytes=kernel.settings.get(MAX_BODY_BYTES_KEY),
