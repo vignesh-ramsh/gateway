@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import traceback
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
@@ -100,6 +101,21 @@ RATE_LIMIT_ENABLED_KEY = "gateway_rate_limit_enabled"
 RATE_LIMIT_REQUESTS_KEY = "gateway_rate_limit_requests"
 RATE_LIMIT_WINDOW_SECONDS_KEY = "gateway_rate_limit_window_seconds"
 
+DEBUG_KEY = "gateway_debug"
+DEBUG_ROLES_KEY = "gateway_debug_roles"
+# "*" reuses the SAME sentinel relay's own RBAC check already gives this
+# exact meaning to (WhitelistedFunction roles=["*"] -> "any authenticated
+# identity", _wire_gateway_route's own `if "*" in wf.roles`) — every
+# authenticated caller (not the ambient, always-available "Guest" — see
+# that same check's own `caller_roles | {"Guest"}`) gets full exception
+# detail on an unhandled 500 by default; an anonymous/no-identity caller
+# never does, in any configuration. Narrow it to specific role names
+# (comma-separated, e.g. "Superuser,Support") to restrict further — a
+# caller whose own roles already include "*" (authn's Superuser
+# convention) always qualifies regardless, same as it would for any
+# other role-gated route.
+DEFAULT_DEBUG_ROLES = "*"
+
 MAINTENANCE_MODE_KEY = "gateway_maintenance_mode"
 # 300 req/60s (5/sec sustained) — generous enough that normal admin-console
 # usage (a page load firing several requests near-simultaneously, infinite
@@ -113,6 +129,59 @@ DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 
 _logger = logging.getLogger("gateway")
+
+#: Below this length a "secret" is almost certainly a placeholder/empty
+#: value, not a real one — redacting it would risk blind-replacing short,
+#: unrelated substrings (a stray "1", an empty string matching everywhere)
+#: throughout the exception text instead of an actual leaked secret.
+_MIN_REDACTABLE_SECRET_LENGTH = 8
+
+
+def _redact_known_secrets(text: str, kernel: Any) -> str:
+    """Replaces any exact occurrence of a currently-declared secret
+    SETTING's real value (signing keys, DSNs, API tokens — anything this
+    app itself manages via kernel.settings.declare(..., secret=True))
+    with a placeholder, before exception detail ever reaches a response.
+    Deliberately narrow: this can't catch a secret that was never a
+    tracked setting in the first place (e.g. a user's own password typed
+    into some ad-hoc string) — it closes the worst, most mechanical class
+    of leak using infrastructure that already exists, not a general PII
+    scanner."""
+    try:
+        declared = kernel.settings.list_all()
+    except Exception:
+        return text
+    for key, meta in declared.items():
+        if meta.get("kind") != "secret":
+            continue
+        try:
+            value = kernel.settings.get(key, reveal=True)
+        except Exception:
+            continue
+        if isinstance(value, str) and len(value) >= _MIN_REDACTABLE_SECRET_LENGTH:
+            text = text.replace(value, "***REDACTED***")
+    return text
+
+
+def _caller_gets_debug_detail(kernel: Any, identity: Any) -> bool:
+    """Whether THIS caller should see real exception detail on an
+    unhandled 500 — see DEBUG_ROLES_KEY's own comment for the "*" sentinel
+    and the Guest/authenticated distinction. `gateway_debug` (unconditional,
+    every caller) is a separate, OFF-by-default escape hatch for an
+    authn-less deployment, where no identity/roles exist to gate on at
+    all."""
+    if kernel.settings.get(DEBUG_KEY):
+        return True
+    raw = (kernel.settings.get(DEBUG_ROLES_KEY) or "").strip()
+    if not raw:
+        return False
+    if raw == "*":
+        return identity is not None
+    caller_roles = set(getattr(identity, "roles", None) or [])
+    if "*" in caller_roles:
+        return True
+    configured = {r.strip() for r in raw.split(",") if r.strip()}
+    return bool(caller_roles & configured)
 
 
 class GatewayProvider:
@@ -585,13 +654,26 @@ class GatewayProvider:
             await send_error(send, scope, exc.status_code, exc.detail)
             return
         except Exception as exc:
-            # Anything else is a genuine bug, not a client mistake — log the
-            # full traceback server-side (never exposed to the caller) and
-            # return a generic 500 rather than letting it escape unstructured
-            # to Granian, unlogged, with whatever detail happened to be in
-            # the exception potentially reaching the response.
+            # Anything else is a genuine bug, not a client mistake — always
+            # logged server-side, in full, regardless of what (if anything)
+            # also goes back in the response. Whether the RESPONSE itself
+            # carries real detail depends on the caller: see
+            # _caller_gets_debug_detail's own docstring — an anonymous or
+            # ordinary-role caller gets the same generic message this
+            # always returned; an authenticated caller matching
+            # gateway_debug_roles (any real identity, by default) gets the
+            # exception type/message/traceback instead, so the common "I
+            # just broke my own new endpoint" case doesn't require tailing
+            # server logs — with known secrets redacted first either way.
             _logger.exception("unhandled exception in %s %s", method, path)
-            await send_json(send, 500, {"error": "internal server error"})
+            identity = scope.get("state", {}).get("arc_identity")
+            if _caller_gets_debug_detail(self._kernel, identity):
+                detail = _redact_known_secrets(
+                    f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}", self._kernel
+                )
+                await send_json(send, 500, {"error": "internal server error", "detail": detail})
+            else:
+                await send_json(send, 500, {"error": "internal server error"})
             return
 
         if isinstance(result, StreamResponse):
@@ -1033,6 +1115,27 @@ def register(kernel: Any) -> None:
         doc="While on, every request gets a 503 (maintenance page to a "
         "browser, JSON to an API client) instead of routing normally. "
         "Read fresh per request — takes effect immediately, no restart.",
+    )
+    kernel.settings.declare(
+        DEBUG_KEY,
+        type=bool,
+        default=False,
+        doc="Include exception type/message/traceback in EVERY caller's 500 "
+        "response, authenticated or not. Off by default — prefer "
+        "gateway_debug_roles instead; this exists for an authn-less "
+        "deployment with no identity/roles to gate on at all.",
+    )
+    kernel.settings.declare(
+        DEBUG_ROLES_KEY,
+        default=DEFAULT_DEBUG_ROLES,
+        doc="Comma-separated roles that get full exception detail on an "
+        "unhandled 500, instead of the generic message. Default '*' means "
+        "any authenticated caller (never an anonymous/no-identity one, "
+        "in any configuration) — narrow to specific role names (e.g. "
+        "'Superuser,Support') to restrict further. Known secret SETTINGS "
+        "are redacted from the detail either way, but it can still surface "
+        "internal structure (table/column/variable names) — grant with "
+        "that in mind. Read fresh per request, no restart needed.",
     )
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
