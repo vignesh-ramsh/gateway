@@ -240,13 +240,30 @@ def cors_middleware(allowed_origins: list[str] | None) -> Middleware:
     return middleware
 
 
-def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> Middleware:
+def csrf_middleware(kernel: Any, *, enabled: bool, header_name: bytes = b"x-csrf-token") -> Middleware:
     """Default on (see register()'s own comment for why) — matters for
     cookie-session auth, not bearer tokens, so most API-only deployments
     never notice it. When enabled,
     unsafe methods carrying an `arc_session` cookie must also carry a
     `X-CSRF-Token` header matching a `csrf_token` cookie (the standard
-    double-submit-cookie pattern).
+    double-submit-cookie pattern) — STRENGTHENED to a signed double-
+    submit when authn is installed: the expected header value is
+    recomputed server-side from the session cookie itself
+    (kernel.get("authn").verify_csrf_token, the same lazy, duck-typed,
+    per-request lookup identity_middleware already uses — gateway never
+    imports authn's own module), not read back off the csrf_token
+    cookie's own content. A PLAIN double-submit is only as strong as
+    "attacker can't READ a cookie for this origin" — but forging one
+    never required reading the real value in the first place, only
+    WRITING a chosen value as both cookie and header (a sibling-
+    subdomain XSS, or a cookie-injection bug elsewhere, can often write
+    a cookie for a shared scope without being able to read this
+    origin's own). Recomputing the expected value from a secret the
+    attacker never has closes that; see authn's own sign_csrf_token/
+    verify_csrf_token docstrings for the full reasoning. Falls back to
+    the old plain compare only when authn isn't installed at all — CSRF
+    only ever matters for a session cookie, which nothing but authn
+    mints, so this fallback is defensive, not a real gap in practice.
 
     Deliberately scoped to requests that already carry a session cookie —
     NOT every unsafe method. /login has no session cookie yet (that's the
@@ -265,17 +282,24 @@ def csrf_middleware(*, enabled: bool, header_name: bytes = b"x-csrf-token") -> M
                 return await app(scope, receive, send)
 
             cookies = cookies_from_scope(scope)
-            if "arc_session" not in cookies:
+            session_token = cookies.get("arc_session")
+            if session_token is None:
                 return await app(scope, receive, send)
 
             token_header = get_header(scope, header_name)
             token_cookie = cookies.get("csrf_token")
+            header_str = token_header.decode("latin-1") if token_header else None
 
-            if (
-                not token_header
-                or not token_cookie
-                or not hmac.compare_digest(token_header.decode("latin-1"), token_cookie)
-            ):
+            authn_provider = kernel.get("authn") if kernel.has("authn") else None
+            verify_fn = getattr(authn_provider, "verify_csrf_token", None)
+            if callable(verify_fn):
+                valid = bool(token_cookie) and bool(header_str) and verify_fn(session_token, header_str)
+            else:
+                valid = bool(token_cookie) and bool(header_str) and hmac.compare_digest(
+                    header_str, token_cookie
+                )
+
+            if not valid:
                 await send(
                     {
                         "type": "http.response.start",

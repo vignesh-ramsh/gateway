@@ -169,7 +169,7 @@ class GatewayProvider:
             request_id_middleware(),
             security_headers_middleware(hsts=hsts),
             cors_middleware(cors_origins),
-            csrf_middleware(enabled=csrf_enabled),
+            csrf_middleware(kernel, enabled=csrf_enabled),
             self._build_client_ip_middleware(),
         ]
         # Captured right where client_ip is appended, not derived from the
