@@ -14,13 +14,13 @@ business validation (§2: that needs the object model, which is Relay's
 job). Boots and runs standalone with zero other plugins installed
 (requires=[], optional_requires=["authn"]).
 
-Lifecycle note: unlike psqldb/redix, Gateway's own ASGI "lifespan" protocol
+Lifecycle note: unlike pgdb/redix, Gateway's own ASGI "lifespan" protocol
 is the natural home for the open()/close() calls those plugins otherwise
 need called manually — see _open_all_capabilities/_close_all_capabilities
 below. Any capability with an open()/close() method (duck-typed, same
 pattern as health()) gets started/stopped automatically once Gateway is
 actually served — closing the "manual lifecycle" gap flagged when
-psqldb/redix were built. Gateway never knows these are "psqldb"/"redix".
+pgdb/redix were built. Gateway never knows these are "pgdb"/"redix".
 """
 
 from __future__ import annotations
@@ -551,7 +551,7 @@ class GatewayProvider:
 
         `requests` is this PROCESS's own counters since it started (see
         RequestMetrics) — a multi-worker deployment has one independent
-        set per worker, same posture as psqldb's pool_stats() and
+        set per worker, same posture as pgdb's pool_stats() and
         arc.events.stats(); no cross-process aggregation happens here."""
         return {
             "ok": True,
@@ -1028,7 +1028,7 @@ class GatewayProvider:
                     # reload-stamp bridge that turns cross-process
                     # notifications into a local system.reload event
                     # (arc.events' own docstring). AFTER open_all — the
-                    # stamp poll reads through psqldb's pool.
+                    # stamp poll reads through pgdb's pool.
                     _arc.events.install_process_bridge(role="gateway-worker")
                     _arc.log.set_role("gateway-worker")
                 except Exception as exc:

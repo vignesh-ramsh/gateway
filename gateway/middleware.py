@@ -46,7 +46,7 @@ Middleware = Callable[[ASGIApp], ASGIApp]
 
 class RequestMetrics:
     """Per-process, in-memory request counters — the same "this process's
-    own self-report" posture as psqldb's pool_stats()/arc.events.stats():
+    own self-report" posture as pgdb's pool_stats()/arc.events.stats():
     no cross-process aggregation, resets on restart, read through
     GatewayProvider.health() (arc.health.check() picks it up from there
     for free). Gateway is the only thing that ever sees every request, so
@@ -427,7 +427,7 @@ def identity_middleware(kernel: Any) -> Middleware:
     arc's topological resolver only guarantees HARD requires load before a
     dependent (§3.1) — an optional_requires edge (gateway optionally wants
     authn) can lose to a hard-requires chain elsewhere (authn hard-requires
-    relay, which hard-requires psqldb) and still boot fine, just in the
+    relay, which hard-requires pgdb) and still boot fine, just in the
     "wrong" relative order for this specific optional preference (`arc
     doctor` prints an explicit warning when this happens). Concretely:
     gateway has zero hard requires, so the resolver is free to boot it

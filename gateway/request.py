@@ -9,7 +9,7 @@ route declared a `request_schema`; handlers that need raw access still have
 
 Decoding/encoding goes through arc.codec (not msgspec directly, even though
 that's what arc.codec itself uses underneath) — this used to import msgspec
-and call it directly, which was the same job psqldb's jsonb columns were
+and call it directly, which was the same job pgdb's jsonb columns were
 independently reinventing with stdlib json. One shared codec now; gateway
 no longer needs msgspec as its own dependency at all.
 """

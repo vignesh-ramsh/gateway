@@ -1,7 +1,7 @@
 """
 gateway.cli — `arc gateway ...` commands.
 
-Mounted via the `arc.plugins.cli` entry point, same pattern as psqldb.cli
+Mounted via the `arc.plugins.cli` entry point, same pattern as pgdb.cli
 and redix.cli.
 """
 
