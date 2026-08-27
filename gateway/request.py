@@ -280,6 +280,72 @@ async def send_json(
     )
 
 
+def _parse_if_none_match(raw: str) -> str:
+    """Bare hex digest from a client's If-None-Match value — strips the
+    surrounding quotes every real ETag carries, and an optional leading
+    `W/` (what a compressing intermediary like nginx rewrites a STRONG
+    ETag into when it gzips the response on the fly, since nginx 1.7.3 —
+    the compressed bytes are a different representation of the same
+    content, so HTTP's weak-validator semantics apply; this is correct,
+    spec-conforming behavior on the intermediary's part, not something to
+    route around there). A client faithfully replaying back exactly what
+    it was given still needs to match send_json_with_etag's own STRONG
+    tag underneath that prefix, so it's stripped here before comparing.
+
+    Doesn't parse a comma-separated multi-value If-None-Match (rare for a
+    same-origin API client that's just replaying back a single value it
+    was given) — an unparsed value simply never matches, which costs a
+    redundant 200 instead of ever risking a wrong 304."""
+    value = raw.strip()
+    if value.startswith("W/"):
+        value = value[2:]
+    return value.strip('"')
+
+
+async def send_json_with_etag(
+    send,
+    status_code: int,
+    content: Any,
+    *,
+    etag: bool,
+    if_none_match: str | None,
+    extra_headers: dict[str, str] | None = None,
+    cookies: "list[Cookie] | None" = None,
+) -> None:
+    """The one call site gateway._dispatch needs for BOTH its JSON
+    branches — `etag` is `route.etag` (see GatewayProvider.add_route's
+    own docstring), so this degrades to a plain send_json itself whenever
+    the route didn't opt in, or the status isn't 200 (an error/redirect
+    has no conditional-GET semantics to apply): callers never need their
+    own if/else between this and send_json. `if_none_match` is the
+    caller's raw If-None-Match header value (or None if it sent none) —
+    gateway._dispatch is the one real caller, passing
+    `request.headers.get("if-none-match")` straight through.
+
+    The ETag itself is a STRONG validator: `arc.hash()` (SHA-256) of the
+    exact body bytes about to be sent, quoted per RFC 9110 — genuinely
+    content-addressed, not a weaker "semantically equivalent" claim. Pure
+    bandwidth optimization, nothing else: the handler that produced
+    `content` already ran in full by the time this is called (there is no
+    way to know the CURRENT body matches without producing it first), and
+    this sets no caching policy of its own — whatever Cache-Control the
+    caller already put in `extra_headers` (gateway._dispatch's own
+    "no-store" default, unless a handler set its own) is left untouched
+    and applied to the 304 too, exactly as it would be to a 200."""
+    if not etag or status_code != 200:
+        await send_json(send, status_code, content, extra_headers=extra_headers, cookies=cookies)
+        return
+
+    body = encode_json(content)
+    response_etag = f'"{arc.hash(body)}"'
+    headers = {**(extra_headers or {}), "ETag": response_etag}
+
+    if if_none_match is not None and arc.verify_hash(body, _parse_if_none_match(if_none_match)):
+        await send_bytes(send, 304, b"", content_type="application/json", extra_headers=headers, cookies=cookies)
+        return
+    await send_bytes(send, status_code, body, content_type="application/json", extra_headers=headers, cookies=cookies)
+
+
 async def send_bytes(
     send,
     status_code: int,

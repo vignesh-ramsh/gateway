@@ -66,6 +66,7 @@ from .request import (
     read_body,
     send_bytes,
     send_json,
+    send_json_with_etag,
     send_stream,
 )
 from .router import WEBSOCKET_METHOD, Router, RouterError
@@ -329,6 +330,7 @@ class GatewayProvider:
         response_schema: Any | None = None,
         summary: str | None = None,
         max_body_bytes: int | None = None,
+        etag: bool = False,
     ) -> None:
         """Register a route. Relay (Phase 3) will call this the same way any
         other caller does — Gateway never hardcodes knowledge of Resources.
@@ -338,7 +340,20 @@ class GatewayProvider:
         pass a value to give ONE route its own larger (or smaller) outer
         ASGI-level body limit — e.g. a file-upload endpoint that needs to
         accept much bigger requests than an ordinary JSON API call, without
-        raising the shared ceiling every other endpoint is also bounded by."""
+        raising the shared ceiling every other endpoint is also bounded by.
+
+        `etag`: conditional-GET support for this route's 200 JSON responses
+        (see `_maybe_send_json_with_etag` in `_dispatch`) — a strong ETag
+        (`arc.hash()` of the exact response body) is set on every 200, and a
+        request whose `If-None-Match` matches gets a bodyless 304 instead.
+        Purely a bandwidth optimization: the handler still runs in full on
+        every request (there's no way to know the CURRENT body matches
+        without producing it first) — this never skips computation, and it
+        carries no caching policy of its own (every response still gets
+        this class's own `Cache-Control: no-store` unless a handler sets its
+        own). False for anything gateway itself registers; relay's
+        whitelisting layer is the only caller that ever passes True, and
+        only for a GET/QUERY route."""
         first_segment = next((s for s in path.strip("/").split("/") if s), None)
         if first_segment is not None and first_segment in self._spa_mounts:
             raise RouterError(
@@ -353,6 +368,7 @@ class GatewayProvider:
             response_schema=response_schema,
             summary=summary,
             max_body_bytes=max_body_bytes,
+            etag=etag,
         )
         self._built_app = None
 
@@ -740,10 +756,12 @@ class GatewayProvider:
                 # even though the backend was already correct and live.
                 headers = {"Cache-Control": "no-store", **result.headers}
                 if result.media_type == "application/json":
-                    await send_json(
+                    await send_json_with_etag(
                         send,
                         result.status_code,
                         result.content,
+                        etag=route.etag,
+                        if_none_match=request.headers.get("if-none-match"),
                         extra_headers=headers,
                         cookies=result.cookies,
                     )
@@ -767,7 +785,14 @@ class GatewayProvider:
                 # (no Response object of its own), e.g. every example in this
                 # session's own investigation (list_filer_settings,
                 # get_filer_antivirus_status).
-                await send_json(send, 200, result, extra_headers={"Cache-Control": "no-store"})
+                await send_json_with_etag(
+                    send,
+                    200,
+                    result,
+                    etag=route.etag,
+                    if_none_match=request.headers.get("if-none-match"),
+                    extra_headers={"Cache-Control": "no-store"},
+                )
         except Exception as exc:
             # A handler can return successfully and STILL fail here — e.g.
             # a return value encode_json can't serialize (an un-awaited

@@ -59,6 +59,17 @@ class RouteEntry:
     # accept a much bigger body than every other endpoint without raising
     # the shared global ceiling that bounds ordinary JSON payloads too.
     max_body_bytes: int | None = None
+    # ETag/conditional-GET support (2026-08-27) — always False for anything
+    # gateway itself registers (the SPA mount path, the builtin routes) and
+    # for a WebSocket route; only relay's whitelisting layer ever passes
+    # True, and only for a GET/QUERY registration of a function that didn't
+    # opt out (see relay/whitelisting.py's own _resolve_etag). Deliberately
+    # a plain per-RouteEntry bool rather than gateway re-deriving "is this
+    # method eligible" itself from `method` — that's a whitelisting-layer
+    # POLICY decision (which verbs conditional-GET semantics apply to),
+    # not something the generic transport layer should hardcode; gateway's
+    # own _dispatch just does what this flag says.
+    etag: bool = False
     # WebSocket routes only (method == WEBSOCKET_METHOD) — who's allowed to
     # open this connection, same shape as relay.whitelist()'s own `roles`
     # (None/"*" meaning any authenticated identity). An ordinary HTTP route
@@ -136,6 +147,7 @@ class Router:
         response_schema: Any | None = None,
         summary: str | None = None,
         max_body_bytes: int | None = None,
+        etag: bool = False,
     ) -> None:
         method = method.upper()
         node = self._ensure_node(path)
@@ -149,6 +161,7 @@ class Router:
             response_schema=response_schema,
             summary=summary,
             max_body_bytes=max_body_bytes,
+            etag=etag,
         )
 
     def add_ws_route(
