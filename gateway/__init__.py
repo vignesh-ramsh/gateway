@@ -53,7 +53,7 @@ from .middleware import (
     tracing_middleware,
 )
 from .error_pages import send_error
-from .openapi import build_openapi_spec
+from .openapi import build_openapi_spec, render_openapi_css, render_openapi_html
 from .request import (
     HTTPError,
     Request,
@@ -342,6 +342,8 @@ class GatewayProvider:
         summary: str | None = None,
         max_body_bytes: int | None = None,
         etag: bool = False,
+        plugin: str | None = None,
+        roles: frozenset[str] | None = None,
     ) -> None:
         """Register a route. Relay (Phase 3) will call this the same way any
         other caller does — Gateway never hardcodes knowledge of Resources.
@@ -364,7 +366,20 @@ class GatewayProvider:
         this class's own `Cache-Control: no-store` unless a handler sets its
         own). False for anything gateway itself registers; relay's
         whitelisting layer is the only caller that ever passes True, and
-        only for a GET/QUERY route."""
+        only for a GET/QUERY route.
+
+        `plugin`: which plugin owns this route, for the /openapi UI page to
+        group by. None for anything gateway registers on its own behalf;
+        relay's whitelisting layer passes its own WhitelistedFunction.plugin
+        here, the only caller with a real plugin name to give.
+
+        `roles`: documentation-only for an ordinary HTTP route — real
+        enforcement already happens inside `handler` itself (relay's own
+        RBAC check, before this method is ever reached); nothing in HTTP
+        dispatch reads this field. Only a WebSocket route (add_ws_route)
+        actually enforces it, at handshake time. Populated here so the
+        /openapi UI can show "allowed roles" per route without a second,
+        parallel channel for the same information."""
         first_segment = next((s for s in path.strip("/").split("/") if s), None)
         if first_segment is not None and first_segment in self._spa_mounts:
             raise RouterError(
@@ -380,6 +395,8 @@ class GatewayProvider:
             summary=summary,
             max_body_bytes=max_body_bytes,
             etag=etag,
+            plugin=plugin,
+            roles=roles,
         )
         self._built_app = None
 
@@ -1112,6 +1129,21 @@ class GatewayProvider:
 
         self._router.add_route(
             "GET", "/openapi.json", _openapi_handler, summary="OpenAPI 3.0 document"
+        )
+
+        async def _openapi_ui_handler(request: Request) -> Response:
+            text = render_openapi_html(self._router.all_routes())
+            return Response(content=text, media_type="text/html; charset=utf-8")
+
+        self._router.add_route(
+            "GET", "/openapi", _openapi_ui_handler, summary="Browsable API routes, grouped by plugin"
+        )
+
+        async def _openapi_css_handler(request: Request) -> Response:
+            return Response(content=render_openapi_css(), media_type="text/css; charset=utf-8")
+
+        self._router.add_route(
+            "GET", "/openapi.css", _openapi_css_handler, summary="Stylesheet for /openapi"
         )
 
         async def _metrics_handler(request: Request) -> Response:

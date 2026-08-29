@@ -79,6 +79,14 @@ class RouteEntry:
     # handler and the wire — so gateway checks this itself, at handshake
     # time, before ever accepting the connection.
     roles: frozenset[str] | None = None
+    # Which plugin registered this route, for anything that wants to GROUP
+    # routes by owner rather than just list them flat — the /openapi UI
+    # page being the first (only) consumer. None for anything gateway
+    # registers on its own behalf (the builtin routes) — relay is the only
+    # caller that ever has a real plugin name to pass (WhitelistedFunction.
+    # plugin, already tracked there for its own error messages), so this
+    # stays None unless relay's own _wire_gateway_route sets it explicitly.
+    plugin: str | None = None
 
 
 @dataclass
@@ -148,6 +156,8 @@ class Router:
         summary: str | None = None,
         max_body_bytes: int | None = None,
         etag: bool = False,
+        plugin: str | None = None,
+        roles: frozenset[str] | None = None,
     ) -> None:
         method = method.upper()
         node = self._ensure_node(path)
@@ -162,6 +172,8 @@ class Router:
             summary=summary,
             max_body_bytes=max_body_bytes,
             etag=etag,
+            plugin=plugin,
+            roles=roles,
         )
 
     def add_ws_route(
