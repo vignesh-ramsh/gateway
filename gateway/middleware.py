@@ -44,6 +44,16 @@ ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 Middleware = Callable[[ASGIApp], ASGIApp]
 
 
+#: HTTP methods that never mutate anything — the same "safe" set HTTP
+#: itself defines (RFC 9110 §9.2.1: GET/HEAD/OPTIONS/TRACE), plus ARC's own
+#: QUERY convention (relay/whitelisting.py's _ETAG_ELIGIBLE_METHODS uses the
+#: identical GET+QUERY pairing, for the identical "safe" reasoning). Anything
+#: NOT in this set — POST/PUT/PATCH/DELETE, or a method this set has never
+#: heard of — counts as a write: mutating-by-default is the safer
+#: classification for a method nobody's told this set about yet.
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "QUERY", "TRACE"})
+
+
 class RequestMetrics:
     """Per-process, in-memory request counters — the same "this process's
     own self-report" posture as pgdb's pool_stats()/arc.events.stats():
@@ -58,12 +68,15 @@ class RequestMetrics:
     def __init__(self) -> None:
         self._total = 0
         self._by_status_class: dict[str, int] = {}
+        self._by_operation: dict[str, int] = {"read": 0, "write": 0}
         self._total_duration_ms = 0.0
 
-    def record(self, status: int, duration_ms: float) -> None:
+    def record(self, status: int, duration_ms: float, method: str = "") -> None:
         self._total += 1
         bucket = f"{status // 100}xx" if status else "unknown"
         self._by_status_class[bucket] = self._by_status_class.get(bucket, 0) + 1
+        operation = "read" if method.upper() in _READ_METHODS else "write"
+        self._by_operation[operation] += 1
         self._total_duration_ms += duration_ms
 
     def snapshot(self) -> dict[str, Any]:
@@ -71,7 +84,30 @@ class RequestMetrics:
         return {
             "total": self._total,
             "by_status_class": dict(self._by_status_class),
+            "by_operation": dict(self._by_operation),
             "avg_duration_ms": round(avg, 1),
+        }
+
+    def metrics(self) -> dict[str, Any]:
+        """Same underlying counters as snapshot(), reshaped for
+        arc.metrics.aggregate()/collect() — the duck-typed convention
+        arc.health.check() already established for health(). Exposes the
+        raw SUM of durations, not a pre-divided average: summing an
+        average across N processes is meaningless, whereas summing the
+        raw total (this field) and the raw count (requests_total) lets
+        the average be computed correctly AFTER cross-process
+        aggregation — the same _sum/_count convention Prometheus's own
+        histogram/summary types use, for exactly this reason.
+
+        `requests_by_operation` (read vs write, by HTTP method) is what
+        answers "is this app read-heavy or write-heavy" straight from
+        /metrics — arc_gateway_requests_by_operation{bucket="read"} vs
+        {bucket="write"}, summed across every worker."""
+        return {
+            "requests_total": self._total,
+            "requests_by_status_class": dict(self._by_status_class),
+            "requests_by_operation": dict(self._by_operation),
+            "request_duration_ms_sum": round(self._total_duration_ms, 1),
         }
 
 
@@ -527,7 +563,7 @@ def access_log_middleware(metrics: RequestMetrics) -> Middleware:
                         "identity": getattr(identity, "email", None),
                     },
                 )
-                metrics.record(status, duration_ms)
+                metrics.record(status, duration_ms, method)
 
         return wrapped
 

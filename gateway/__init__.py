@@ -102,6 +102,15 @@ RATE_LIMIT_ENABLED_KEY = "gateway_rate_limit_enabled"
 RATE_LIMIT_REQUESTS_KEY = "gateway_rate_limit_requests"
 RATE_LIMIT_WINDOW_SECONDS_KEY = "gateway_rate_limit_window_seconds"
 
+METRICS_TOKEN_KEY = "gateway_metrics_token"
+# Deliberately a PLAIN setting, not secret=True: a scrape credential read
+# on every single Prometheus scrape (every few seconds) would spam
+# arc.store's reveal-only secret_access_log with pure noise if declared
+# secret — that log exists for meaningful superuser reveals, not routine
+# machine-to-machine polling. Empty/unset (the default) means /metrics is
+# open, same posture as /openapi.json — protect it via network boundary/
+# reverse proxy, or set this for an Authorization: Bearer <token> gate.
+
 DEBUG_KEY = "gateway_debug"
 DEBUG_ROLES_KEY = "gateway_debug_roles"
 # "*" reuses the SAME sentinel relay's own RBAC check already gives this
@@ -574,6 +583,15 @@ class GatewayProvider:
             "routes": len(self._router.all_routes()),
             "requests": self._metrics.snapshot(),
         }
+
+    def metrics(self) -> dict:
+        """arc.metrics.collect()'s duck-typed hook — same convention as
+        health() above, sync rather than async since RequestMetrics.
+        metrics() is a cheap in-memory read, no I/O. This PROCESS's own
+        counters since it started; arc.metrics' own exporter/aggregate()
+        machinery is what turns every worker's own call to this into one
+        cross-process picture at /metrics, not this method itself."""
+        return self._metrics.metrics()
 
     # ------------------------------------------------------------------ #
     # ASGI 3.0 entrypoint
@@ -1055,6 +1073,7 @@ class GatewayProvider:
                     # (arc.events' own docstring). AFTER open_all — the
                     # stamp poll reads through pgdb's pool.
                     _arc.events.install_process_bridge(role="gateway-worker")
+                    _arc.metrics.start_exporter(role="gateway-worker")
                     _arc.log.set_role("gateway-worker")
                 except Exception as exc:
                     await send({"type": "lifespan.startup.failed", "message": str(exc)})
@@ -1063,6 +1082,7 @@ class GatewayProvider:
             elif message["type"] == "lifespan.shutdown":
                 try:
                     await _arc.events.uninstall_process_bridge()
+                    await _arc.metrics.stop_exporter()
                     await self._close_all_capabilities()
                     await send({"type": "lifespan.shutdown.complete"})
                 except Exception as exc:
@@ -1088,6 +1108,30 @@ class GatewayProvider:
 
         self._router.add_route(
             "GET", "/openapi.json", _openapi_handler, summary="OpenAPI 3.0 document"
+        )
+
+        async def _metrics_handler(request: Request) -> Response:
+            import arc as _arc  # gateway has no module-level arc import, see lifespan's own comment
+
+            token = self._kernel.settings.get(METRICS_TOKEN_KEY)
+            if token:
+                auth = request.headers.get("authorization", "")
+                if auth != f"Bearer {token}":
+                    return Response(
+                        content="unauthorized\n",
+                        status_code=401,
+                        media_type="text/plain; charset=utf-8",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+            snapshots = _arc.metrics.read_all(self._kernel.project_root)
+            text = _arc.metrics.format_prometheus(_arc.metrics.aggregate(snapshots))
+            return Response(content=text, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+        self._router.add_route(
+            "GET",
+            "/metrics",
+            _metrics_handler,
+            summary="Prometheus text-exposition metrics, aggregated across every ARC process",
         )
 
 
@@ -1206,6 +1250,14 @@ def register(kernel: Any) -> None:
         "are redacted from the detail either way, but it can still surface "
         "internal structure (table/column/variable names) — grant with "
         "that in mind. Read fresh per request, no restart needed.",
+    )
+    kernel.settings.declare(
+        METRICS_TOKEN_KEY,
+        default="",
+        doc="Bearer token required on GET /metrics. Empty/unset (default) "
+        "leaves /metrics open — protect it via network boundary/reverse "
+        "proxy instead, or set this for an Authorization: Bearer <token> "
+        "gate. Read fresh per request, no restart needed.",
     )
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
