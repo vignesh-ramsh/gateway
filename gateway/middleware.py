@@ -3,14 +3,18 @@ gateway.middleware
 -------------------
 Standard ASGI middleware convention throughout: `middleware(app) -> app`,
 where `app(scope, receive, send)` is awaitable. Composed in a fixed order
-(see gateway/__init__.py): request_id -> security headers -> CORS -> CSRF ->
-client_ip -> identity -> access_log.
+(see gateway/__init__.py): request_id -> tracing -> security headers -> CORS
+-> CSRF -> client_ip -> identity -> access_log.
 
 request_id_middleware is OUTERMOST deliberately — every other middleware
 (and the access log innermost of all) can then read
 scope["state"]["arc_request_id"], and a request that is rejected early
 (a CSRF failure, a 413 body-too-large) still carries the same correlation
 id in its response as one that reached a handler.
+
+tracing_middleware is second-outermost, right after request_id, for the
+identical reason: its root span needs to cover every OTHER middleware in
+the chain, including one that rejects a request early.
 
 The identity-resolution slot (§3.3/§3.13) is unconditional — composed into
 the pipeline always, resolving `kernel.get("authn")` lazily PER REQUEST
@@ -36,7 +40,7 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
-from .request import cookies_from_scope, get_header, send_json
+from .request import cookies_from_scope, get_header, headers_from_scope, send_json
 
 _logger = logging.getLogger("gateway")
 
@@ -160,6 +164,79 @@ def request_id_middleware() -> Middleware:
 
             scope = {**scope, "state": {**scope.get("state", {}), "arc_request_id": request_id}}
             await app(scope, receive, send_wrapper)
+
+        return wrapped
+
+    return middleware
+
+
+def tracing_middleware() -> Middleware:
+    """Root span for the whole request — second-outermost, right after
+    request_id_middleware (so `scope["state"]["arc_request_id"]` is
+    already set) and wrapping everything else: security headers, CORS,
+    CSRF, client_ip, identity, access_log, rate_limit, and _dispatch
+    itself.
+
+    A single `arc.tracing.get_tracer() is None` check up front is the
+    ENTIRE cost when tracing is off — no span, no context extraction, no
+    per-request work of any kind, not even a no-op object; this is what
+    makes "tracing off" actually free rather than merely cheap.
+
+    Extracts a real W3C `traceparent` header via OTel's own propagator
+    (`opentelemetry.propagate.extract`) rather than hand-parsing it —
+    the whole reason this uses the real SDK instead of a hand-rolled
+    format is to not get this subtly wrong. A request with no inbound
+    traceparent (the common case — nothing upstream is instrumented, or
+    this is the first ARC-owned hop) simply starts a new trace; extract()
+    returns an empty context either way, so there's no separate branch
+    for "have header" vs "don't"."""
+
+    def middleware(app: ASGIApp) -> ASGIApp:
+        async def wrapped(scope, receive, send):
+            if scope["type"] != "http":
+                return await app(scope, receive, send)
+
+            import arc  # gateway has no module-level arc import, same lazy-import posture as elsewhere here
+
+            tracer = arc.tracing.get_tracer()
+            if tracer is None:
+                return await app(scope, receive, send)
+
+            from opentelemetry.propagate import extract
+
+            parent_ctx = extract(headers_from_scope(scope))
+            status_holder: dict[str, int] = {}
+
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start":
+                    status_holder["status"] = message["status"]
+                await send(message)
+
+            state = scope.get("state", {})
+            method = scope["method"]
+            path = scope["path"]
+            # "{METHOD} {path}" — standard OTel HTTP-server span-naming
+            # convention (what every OTel-instrumented HTTP framework
+            # names its root span), deliberately NOT "arc."-prefixed, same
+            # exemption as the http.*/db.* ATTRIBUTES below: this follows
+            # an existing semantic convention rather than inventing one.
+            # A fixed generic name here (what this used to be) means every
+            # request's trace looks identical in a trace list until you
+            # open it — this is what makes "POST /login" vs "GET
+            # /openapi.json" distinguishable at a glance.
+            with tracer.start_as_current_span(
+                f"{method} {path}",
+                context=parent_ctx,
+                attributes={
+                    "http.method": method,
+                    "http.target": path,
+                    "arc.request_id": state.get("arc_request_id") or "",
+                },
+            ) as root_span:
+                try:
+                    await app(scope, receive, send_wrapper)
+                finally:
+                    root_span.set_attribute("http.status_code", status_holder.get("status", 0))
 
         return wrapped
 

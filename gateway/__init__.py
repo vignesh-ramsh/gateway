@@ -50,6 +50,7 @@ from .middleware import (
     request_id_middleware,
     resolve_client_ip,
     security_headers_middleware,
+    tracing_middleware,
 )
 from .error_pages import send_error
 from .openapi import build_openapi_spec
@@ -283,6 +284,7 @@ class GatewayProvider:
         # before ever reaching it.
         self._builtin_middlewares: list[Callable[[ASGIApp], ASGIApp]] = [
             request_id_middleware(),
+            tracing_middleware(),
             security_headers_middleware(hsts=hsts, csp=csp, csp_report_only=csp_report_only),
             cors_middleware(cors_origins),
             csrf_middleware(kernel, enabled=csrf_enabled),
@@ -1074,6 +1076,7 @@ class GatewayProvider:
                     # stamp poll reads through pgdb's pool.
                     _arc.events.install_process_bridge(role="gateway-worker")
                     _arc.metrics.start_exporter(role="gateway-worker")
+                    _arc.tracing.start_exporter(role="gateway-worker")
                     _arc.log.set_role("gateway-worker")
                 except Exception as exc:
                     await send({"type": "lifespan.startup.failed", "message": str(exc)})
@@ -1083,6 +1086,7 @@ class GatewayProvider:
                 try:
                     await _arc.events.uninstall_process_bridge()
                     await _arc.metrics.stop_exporter()
+                    _arc.tracing.stop_exporter()
                     await self._close_all_capabilities()
                     await send({"type": "lifespan.shutdown.complete"})
                 except Exception as exc:
