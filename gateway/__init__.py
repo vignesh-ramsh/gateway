@@ -338,6 +338,7 @@ class GatewayProvider:
         handler: Callable[[Request], Any],
         *,
         request_schema: Any | None = None,
+        validate_body: bool = True,
         response_schema: Any | None = None,
         summary: str | None = None,
         max_body_bytes: int | None = None,
@@ -347,6 +348,21 @@ class GatewayProvider:
     ) -> None:
         """Register a route. Relay (Phase 3) will call this the same way any
         other caller does — Gateway never hardcodes knowledge of Resources.
+
+        `validate_body`: whether `_dispatch` should itself decode the raw
+        body against `request_schema` before `handler` ever runs, populating
+        `request.validated` (request.py's own docstring). True (the
+        default) is right for a caller with no validation of its own.
+        Relay's whitelisting layer passes False: it does its own, more
+        complete validation (query string + body + path params merged,
+        correct 400 on a bad value, works for a bodyless GET) before ever
+        calling the whitelisted function, so a second, independent decode
+        of just the raw body here was redundant at best — and, for a
+        plain-kwargs function's hand-built /openapi docs schema (never a
+        real msgspec-decodable type) or a GET carrying no body at all,
+        outright broken: every such request 422'd regardless of what the
+        caller sent. `request_schema` still gets used for the /openapi
+        docs page either way — this only gates the live decode.
 
         `max_body_bytes`: None (default) means this route is bounded by the
         gateway-wide `gateway_max_body_bytes` ceiling like everything else;
@@ -391,6 +407,7 @@ class GatewayProvider:
             path,
             handler,
             request_schema=request_schema,
+            validate_body=validate_body,
             response_schema=response_schema,
             summary=summary,
             max_body_bytes=max_body_bytes,
@@ -736,7 +753,7 @@ class GatewayProvider:
             request_id=scope.get("state", {}).get("arc_request_id"),
         )
 
-        if route.request_schema is not None:
+        if route.request_schema is not None and route.validate_body:
             try:
                 request.validated = request.json(route.request_schema)
             except Exception as exc:

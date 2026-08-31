@@ -44,6 +44,25 @@ class RouteEntry:
     path: str
     handler: Callable[..., Any]
     request_schema: Any | None = None
+    # Whether _dispatch should actually decode+validate the body against
+    # request_schema before calling handler (request.py's own docstring:
+    # "Request.validated carries the arc.codec-decoded body"). True is the
+    # right default for a caller with no validation of its own — gateway
+    # does it for them. False for relay's whitelisted routes specifically
+    # (relay/whitelisting.py's own _wire_gateway_route sets this): relay's
+    # handler already does its own, more complete validation (query string
+    # + body + path params merged, correct 400 — not 422 — on a bad value,
+    # works for a bodyless GET) before ever calling wf.fn, so a SECOND,
+    # independent decode of just the raw body against request_schema was
+    # both redundant and actively wrong — request_schema there is relay's
+    # own hand-built object schema for the /openapi docs page (see
+    # relay.whitelisting._request_schema_for's own docstring), never a real
+    # msgspec-decodable type for a plain-kwargs function, and even the
+    # Struct-typed "payload" style has nothing to decode from an empty GET
+    # body. Verified directly: this is what turned EVERY relay-whitelisted
+    # route with any declared parameter into a permanent 422, regardless of
+    # what the caller actually sent.
+    validate_body: bool = True
     response_schema: Any | None = None
     summary: str | None = None
     # None (the default) means "use the gateway-wide gateway_max_body_bytes
@@ -152,6 +171,7 @@ class Router:
         handler: Callable[..., Any],
         *,
         request_schema: Any | None = None,
+        validate_body: bool = True,
         response_schema: Any | None = None,
         summary: str | None = None,
         max_body_bytes: int | None = None,
@@ -168,6 +188,7 @@ class Router:
             path=path,
             handler=handler,
             request_schema=request_schema,
+            validate_body=validate_body,
             response_schema=response_schema,
             summary=summary,
             max_body_bytes=max_body_bytes,
