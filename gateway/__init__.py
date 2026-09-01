@@ -284,7 +284,7 @@ class GatewayProvider:
         # before ever reaching it.
         self._builtin_middlewares: list[Callable[[ASGIApp], ASGIApp]] = [
             request_id_middleware(),
-            tracing_middleware(),
+            tracing_middleware(router=self._router),
             security_headers_middleware(hsts=hsts, csp=csp, csp_report_only=csp_report_only),
             cors_middleware(cors_origins),
             csrf_middleware(kernel, enabled=csrf_enabled),
@@ -339,6 +339,7 @@ class GatewayProvider:
         *,
         request_schema: Any | None = None,
         validate_body: bool = True,
+        trace: bool = True,
         response_schema: Any | None = None,
         summary: str | None = None,
         max_body_bytes: int | None = None,
@@ -348,6 +349,19 @@ class GatewayProvider:
     ) -> None:
         """Register a route. Relay (Phase 3) will call this the same way any
         other caller does — Gateway never hardcodes knowledge of Resources.
+
+        `trace`: whether `tracing_middleware` should start a root span for
+        a request that matches this route. True (the default) traces
+        everything, same as before this flag existed. Pass False for an
+        endpoint whose traces are pure noise in a real backend — a health
+        check, a metrics scrape — without touching the global
+        `tracing_otlp_endpoint`/`tracing_sample_rate_percent` settings,
+        which still govern whether tracing happens at all/at what rate for
+        every OTHER route. Independent of `validate_body` below despite
+        the similar shape: this gates a middleware that runs BEFORE
+        routing (so tracing_middleware does a second, cheap route lookup
+        of its own to know this — see RouteEntry.trace's own docstring),
+        that one gates a check `_dispatch` makes AFTER routing.
 
         `validate_body`: whether `_dispatch` should itself decode the raw
         body against `request_schema` before `handler` ever runs, populating
@@ -408,6 +422,7 @@ class GatewayProvider:
             handler,
             request_schema=request_schema,
             validate_body=validate_body,
+            trace=trace,
             response_schema=response_schema,
             summary=summary,
             max_body_bytes=max_body_bytes,

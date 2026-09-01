@@ -170,7 +170,7 @@ def request_id_middleware() -> Middleware:
     return middleware
 
 
-def tracing_middleware() -> Middleware:
+def tracing_middleware(*, router: Any = None) -> Middleware:
     """Root span for the whole request — second-outermost, right after
     request_id_middleware (so `scope["state"]["arc_request_id"]` is
     already set) and wrapping everything else: security headers, CORS,
@@ -189,7 +189,23 @@ def tracing_middleware() -> Middleware:
     traceparent (the common case — nothing upstream is instrumented, or
     this is the first ARC-owned hop) simply starts a new trace; extract()
     returns an empty context either way, so there's no separate branch
-    for "have header" vs "don't"."""
+    for "have header" vs "don't".
+
+    `router` (2026-09-01, per-route tracing opt-out): this middleware
+    wraps _dispatch, so it runs BEFORE _dispatch's own routing — the only
+    way to honor a matched route's RouteEntry.trace=False is a second,
+    independent gateway.router.Router.match() done right here, before
+    the span is started. A pure, cheap trie lookup (no state, no I/O);
+    doing it twice per request (once here, once in _dispatch) is a small,
+    bounded cost against starting and exporting a whole span. `router`
+    is `Any`-typed and optional (never None in practice — GatewayProvider
+    always passes its own) specifically so this module doesn't need a
+    hard import of router.py, matching the rest of this file's lazy-
+    import posture; None just means "can't check, so trace everything",
+    the same behavior this middleware always had before this parameter
+    existed. An UNMATCHED request (no route at all — a genuine 404) is
+    unaffected either way and still gets a span, same as always: there's
+    no RouteEntry to carry False for it."""
 
     def middleware(app: ASGIApp) -> ASGIApp:
         async def wrapped(scope, receive, send):
@@ -201,6 +217,11 @@ def tracing_middleware() -> Middleware:
             tracer = arc.tracing.get_tracer()
             if tracer is None:
                 return await app(scope, receive, send)
+
+            if router is not None:
+                match = router.match(scope["method"], scope["path"])
+                if match.route is not None and not match.route.trace:
+                    return await app(scope, receive, send)
 
             from opentelemetry.propagate import extract
 

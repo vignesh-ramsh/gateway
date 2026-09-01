@@ -63,6 +63,23 @@ class RouteEntry:
     # route with any declared parameter into a permanent 422, regardless of
     # what the caller actually sent.
     validate_body: bool = True
+    # Whether tracing_middleware should start a root span for a request
+    # that matches this route (2026-09-01, Improvement Doc's telemetry
+    # opt-out) — checked via a cheap extra router.match() done by that
+    # middleware itself, BEFORE _dispatch's own (separate) match, since
+    # tracing wraps _dispatch and every other middleware inside it and so
+    # has no route to check without looking one up early. True (the
+    # default) traces every route, same as before this flag existed — an
+    # unmatched request (a genuine 404) is unaffected either way, and
+    # still gets a span, since there's no route to carry False. Only
+    # relay's whitelist(trace=False) (or a direct add_route(trace=False)
+    # caller) ever sets this — e.g. a noisy health-check endpoint that
+    # would otherwise dominate a trace backend with uniform, uninteresting
+    # spans. Entirely independent of the GLOBAL tracing_otlp_endpoint/
+    # tracing_sample_rate_percent settings (arc.tracing.declare) — those
+    # decide whether tracing happens AT ALL and at what rate; this decides
+    # whether ONE route ever participates, regardless of either.
+    trace: bool = True
     response_schema: Any | None = None
     summary: str | None = None
     # None (the default) means "use the gateway-wide gateway_max_body_bytes
@@ -172,6 +189,7 @@ class Router:
         *,
         request_schema: Any | None = None,
         validate_body: bool = True,
+        trace: bool = True,
         response_schema: Any | None = None,
         summary: str | None = None,
         max_body_bytes: int | None = None,
@@ -189,6 +207,7 @@ class Router:
             handler=handler,
             request_schema=request_schema,
             validate_body=validate_body,
+            trace=trace,
             response_schema=response_schema,
             summary=summary,
             max_body_bytes=max_body_bytes,
