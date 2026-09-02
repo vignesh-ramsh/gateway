@@ -26,6 +26,7 @@ pgdb/redix were built. Gateway never knows these are "pgdb"/"redix".
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import mimetypes
 import traceback
@@ -177,18 +178,23 @@ def _redact_known_secrets(text: str, kernel: Any) -> str:
     tracked setting in the first place (e.g. a user's own password typed
     into some ad-hoc string) — it closes the worst, most mechanical class
     of leak using infrastructure that already exists, not a general PII
-    scanner."""
+    scanner.
+
+    Reads through settings.secret_values_for_redaction() — one query, no
+    audit-log write — rather than get(key, reveal=True) once per declared
+    secret, which is what this used to do. That reveal path is the ONLY
+    one that writes a secret_access_log row, so every redacted 500 was
+    appending one unattributed row per declared secret (plus a master-key
+    disk read, a Fernet construction, and a synchronous SQLite commit
+    each). That let anyone able to trigger an error flood the reveal-only
+    audit log and bury real superuser reveals underneath it — the exact
+    thing METRICS_TOKEN_KEY's own comment above already refuses to do for
+    routine machine reads; it just hadn't been applied here."""
     try:
-        declared = kernel.settings.list_all()
+        values = kernel.settings.secret_values_for_redaction()
     except Exception:
         return text
-    for key, meta in declared.items():
-        if meta.get("kind") != "secret":
-            continue
-        try:
-            value = kernel.settings.get(key, reveal=True)
-        except Exception:
-            continue
+    for value in values:
         if isinstance(value, str) and len(value) >= _MIN_REDACTABLE_SECRET_LENGTH:
             text = text.replace(value, "***REDACTED***")
     return text
@@ -703,10 +709,16 @@ class GatewayProvider:
         # like every other setting on this class — a toggle only a
         # restarted process would ever see defeats the point of an
         # operational on/off switch a human flips during a live incident
-        # or deploy. Cheap: SettingsManager's own TOML read is cached by
-        # (mtime, size) and only re-parses when `arc set-maintenance` (a
-        # separate process) has actually changed the file, so this costs
-        # one stat() call on every other request. Checked before routing,
+        # or deploy. Cheap: SettingsManager.get() caches plain settings in
+        # process and revalidates with `PRAGMA data_version` — a header
+        # read that only changes once ANOTHER process (e.g. `arc
+        # set-maintenance`) has actually committed — so this costs no real
+        # query on the overwhelming majority of requests. (It genuinely
+        # WAS a full SQLite SELECT per request for a while: this comment
+        # used to describe the pre-SQLite arc.toml store's stat()-keyed
+        # TOML cache and was left behind when settings moved into
+        # arc.store.db, which is exactly what kept the cost invisible.)
+        # Checked before routing,
         # SPA serving, or auth — a site under maintenance shows the same
         # page for every path and every caller, not just the ones that
         # would otherwise have resolved to a real route.
@@ -1184,7 +1196,14 @@ class GatewayProvider:
             token = self._kernel.settings.get(METRICS_TOKEN_KEY)
             if token:
                 auth = request.headers.get("authorization", "")
-                if auth != f"Bearer {token}":
+                # compare_digest, not `!=`: a plain string compare
+                # short-circuits at the first differing byte, which is a
+                # timing side-channel on the token itself. Matches what
+                # every other secret comparison in this project already
+                # does — csrf_middleware's own double-submit check below,
+                # authn's session token check, arc.verify_hash, filer's
+                # signed-URL check. This was the one that didn't.
+                if not hmac.compare_digest(auth, f"Bearer {token}"):
                     return Response(
                         content="unauthorized\n",
                         status_code=401,
