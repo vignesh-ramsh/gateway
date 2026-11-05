@@ -44,6 +44,39 @@ from .request import cookies_from_scope, get_header, headers_from_scope, send_js
 
 _logger = logging.getLogger("gateway")
 
+#: Per-request access lines are logged under a child of "gateway" so they can be
+#: routed on their own: arc.log's category prefixes still send them to
+#: logs/gateway.jsonl, while arc.log.file_only() can keep them off the console.
+ACCESS_LOGGER_NAME = "gateway.access"
+_access_logger = logging.getLogger(ACCESS_LOGGER_NAME)
+
+#: Where each request's access line goes: only to logs/gateway.jsonl ("file", the
+#: default), additionally to the console that `arc run` relays ("console"), or nowhere
+#: ("off"; request metrics are still counted).
+ACCESS_LOG_MODES = ("file", "console", "off")
+DEFAULT_ACCESS_LOG_MODE = "file"
+
+
+def apply_access_log_mode(mode: str) -> None:
+    """Route access lines for `mode` and reject an unknown value loudly.
+
+    "file" keeps them off the console. The console relay is a single Python
+    thread in `arc run` reading every worker's stdout through one pipe; at a few
+    thousand requests per second it saturates a core, the pipe fills, and the
+    workers block in write() with their event loops frozen, which showed up as a
+    p99 of ~70 ms against a ~2 ms median and capped throughput. "console" restores
+    the old behaviour for anyone who wants to watch requests scroll by."""
+    if mode not in ACCESS_LOG_MODES:
+        raise ValueError(
+            f"gateway_access_log must be one of {', '.join(ACCESS_LOG_MODES)}, got {mode!r}"
+        )
+    from arc import log as arc_log
+
+    if mode == "console":
+        arc_log.console_too(ACCESS_LOGGER_NAME)
+    else:
+        arc_log.file_only(ACCESS_LOGGER_NAME)
+
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 Middleware = Callable[[ASGIApp], ASGIApp]
 
@@ -608,12 +641,13 @@ def identity_middleware(kernel: Any) -> Middleware:
     return middleware
 
 
-def access_log_middleware(metrics: RequestMetrics) -> Middleware:
+def access_log_middleware(metrics: RequestMetrics, *, mode: str = DEFAULT_ACCESS_LOG_MODE) -> Middleware:
     """One structured JSON line per request via `logging.getLogger
-    ("gateway")` — arc.log already routes anything logged under that name
-    into logs/gateway.jsonl as real JSON, with any `extra={...}` kwarg
-    becoming real structured fields (see arc.log's own docstring); this
-    just has to actually call it, the infrastructure already exists.
+    ("gateway.access")` — arc.log routes anything logged under "gateway" or a
+    child of it into logs/gateway.jsonl as real JSON, with any `extra={...}`
+    kwarg becoming real structured fields (see arc.log's own docstring).
+    `mode` ("off" skips the line entirely) is where the line goes beyond that;
+    see apply_access_log_mode().
     Updates `metrics` at the same interception point — one wrapper serves
     both jobs, no second pass over every request.
 
@@ -626,6 +660,7 @@ def access_log_middleware(metrics: RequestMetrics) -> Middleware:
     the way through (a bug even gateway's own dispatcher catch-all didn't
     catch) still gets logged and counted before the exception continues
     propagating, rather than silently vanishing from both."""
+    log_requests = mode != "off"
 
     def middleware(app: ASGIApp) -> ASGIApp:
         async def wrapped(scope, receive, send):
@@ -649,18 +684,21 @@ def access_log_middleware(metrics: RequestMetrics) -> Middleware:
                 identity = state.get("arc_identity")
                 method = scope["method"]
                 path = scope["path"]
-                _logger.info(
-                    f"{method} {path} -> {status} ({duration_ms:.0f}ms)",
-                    extra={
-                        "request_id": state.get("arc_request_id"),
-                        "method": method,
-                        "path": path,
-                        "status": status,
-                        "duration_ms": round(duration_ms, 1),
-                        "client_ip": state.get("arc_client_ip"),
-                        "identity": getattr(identity, "email", None),
-                    },
-                )
+                # isEnabledFor() first: skip building the message and the extra={}
+                # dict when the line would be dropped by log_level anyway.
+                if log_requests and _access_logger.isEnabledFor(logging.INFO):
+                    _access_logger.info(
+                        f"{method} {path} -> {status} ({duration_ms:.0f}ms)",
+                        extra={
+                            "request_id": state.get("arc_request_id"),
+                            "method": method,
+                            "path": path,
+                            "status": status,
+                            "duration_ms": round(duration_ms, 1),
+                            "client_ip": state.get("arc_client_ip"),
+                            "identity": getattr(identity, "email", None),
+                        },
+                    )
                 metrics.record(status, duration_ms, method)
 
         return wrapped

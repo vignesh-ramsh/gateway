@@ -37,9 +37,11 @@ from urllib.parse import urlsplit
 import arc
 
 from .middleware import (
+    DEFAULT_ACCESS_LOG_MODE,
     LocalRateLimiter,
     RequestMetrics,
     access_log_middleware,
+    apply_access_log_mode,
     check_rate_limit,
     client_ip_middleware,
     cors_middleware,
@@ -99,6 +101,8 @@ FORWARDED_HEADER_KEY = "gateway_forwarded_header"
 MAX_BODY_BYTES_KEY = "gateway_max_body_bytes"
 DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB — generous for a JSON API body,
 # nowhere near "unbounded" (the bug this fixes)
+
+ACCESS_LOG_KEY = "gateway_access_log"
 
 RATE_LIMIT_ENABLED_KEY = "gateway_rate_limit_enabled"
 RATE_LIMIT_REQUESTS_KEY = "gateway_rate_limit_requests"
@@ -237,8 +241,12 @@ class GatewayProvider:
         rate_limit_enabled: bool = True,
         rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
         rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+        access_log: str = DEFAULT_ACCESS_LOG_MODE,
     ) -> None:
         self._kernel = kernel
+        # Validates `access_log` (raises on an unknown value) and routes the
+        # access lines: off the console unless access_log == "console".
+        apply_access_log_mode(access_log)
         self._router = Router()
         self._spa_mounts: dict[str, Path] = {}
         # path -> (mtime_ns, bytes, content_type); see _try_serve_spa.
@@ -303,7 +311,7 @@ class GatewayProvider:
         self._client_ip_mw_index = len(self._builtin_middlewares) - 1
         self._builtin_middlewares += [
             identity_middleware(kernel),
-            access_log_middleware(self._metrics),
+            access_log_middleware(self._metrics, mode=access_log),
             rate_limit_middleware(
                 kernel,
                 enabled=rate_limit_enabled,
@@ -1283,6 +1291,15 @@ def register(kernel: Any) -> None:
         doc="Global request body size ceiling, in bytes.",
     )
     kernel.settings.declare(
+        ACCESS_LOG_KEY,
+        default=DEFAULT_ACCESS_LOG_MODE,
+        doc="Where each request's access line goes: 'file' (default; only "
+        "logs/gateway.jsonl), 'console' (also the terminal/journal via `arc "
+        "run`; at thousands of requests per second the relay becomes the "
+        "bottleneck), or 'off'. Request metrics are kept in every mode. "
+        "Restart to apply.",
+    )
+    kernel.settings.declare(
         RATE_LIMIT_ENABLED_KEY,
         type=bool,
         default=True,
@@ -1367,5 +1384,6 @@ def register(kernel: Any) -> None:
         rate_limit_enabled=kernel.settings.get(RATE_LIMIT_ENABLED_KEY),
         rate_limit_requests=kernel.settings.get(RATE_LIMIT_REQUESTS_KEY),
         rate_limit_window_seconds=kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY),
+        access_log=kernel.settings.get(ACCESS_LOG_KEY),
     )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=["authn", "redix"])
