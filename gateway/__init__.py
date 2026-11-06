@@ -709,6 +709,22 @@ class GatewayProvider:
         else:
             await send_json(send, 500, {"error": "internal server error"})
 
+    async def _send_unavailable(self, send: Callable, exc: Exception, method: str, path: str) -> None:
+        """An exception that says of itself `http_status = 503` (pgdb's PoolExhausted: no database
+        connection was available) is capacity, not a bug: tell the caller to come back, with
+        Retry-After, instead of a 500 that looks like a defect. Logged as one warning line — a
+        traceback per rejected request would bury the log exactly when the server is busiest. The
+        gateway does not know what raised it; the exception carries `http_status` and, optionally,
+        `retry_after` (seconds)."""
+        _logger.warning("503 for %s %s: %s", method, path, exc)
+        retry_after = getattr(exc, "retry_after", None)
+        await send_json(
+            send,
+            503,
+            {"error": "service temporarily unavailable", "detail": "the server is busy — retry shortly"},
+            extra_headers={"Retry-After": str(int(retry_after))} if retry_after else None,
+        )
+
     async def _dispatch(self, scope: dict, receive: Callable, send: Callable) -> None:
         method = scope["method"]
         path = scope["path"]
@@ -801,7 +817,10 @@ class GatewayProvider:
             await send_error(send, scope, exc.status_code, exc.detail)
             return
         except Exception as exc:
-            await self._send_unhandled_exception(send, scope, exc, method, path)
+            if getattr(exc, "http_status", None) == 503:
+                await self._send_unavailable(send, exc, method, path)
+            else:
+                await self._send_unhandled_exception(send, scope, exc, method, path)
             return
 
         if isinstance(result, StreamResponse):
