@@ -56,6 +56,8 @@ from .middleware import (
     tracing_middleware,
 )
 from .error_pages import send_error
+from .health import HEALTH_PATHS, ReadinessProbe
+from .health import serve as serve_health
 from .openapi import build_openapi_spec, render_openapi_css, render_openapi_html
 from .request import (
     HTTPError,
@@ -258,6 +260,7 @@ class GatewayProvider:
         self._forwarded_header = forwarded_header
         self._max_body_bytes = max_body_bytes
         self._metrics = RequestMetrics()
+        self._readiness = ReadinessProbe(kernel)
         self._rate_limit_fallback = LocalRateLimiter()
         # Stored (not just handed to rate_limit_middleware's own closure
         # below) because _dispatch_websocket needs these too — a
@@ -673,6 +676,11 @@ class GatewayProvider:
             # client_ip/identity itself, the same way each middleware
             # does, at the one point that actually needs them.
             return await self._dispatch_websocket(scope, receive, send)
+        if scope["type"] == "http" and scope["path"] in HEALTH_PATHS:
+            # /healthz and /readyz (gateway/health.py): answered here, ahead of the middleware
+            # chain, so a load balancer polling them leaves no access-log line and no request
+            # metrics, takes no rate-limit slot, and gets its answer under maintenance mode too.
+            return await serve_health(scope, send, self._readiness)
         app = self._compiled_app()
         await app(scope, receive, send)
 
