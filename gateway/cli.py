@@ -40,12 +40,59 @@ def _resolve_sibling_executable(name: str) -> str | None:
     return shutil.which(name)
 
 
+#: Seconds Granian waits before replacing a worker that died.
+RESPAWN_INTERVAL_SECONDS = 1.0
+
+
+def build_granian_argv(
+    granian_bin: str,
+    target: str,
+    *,
+    host: str,
+    port: int,
+    workers: int,
+    reload: bool = False,
+    respawn: bool = True,
+) -> list[str]:
+    """The Granian command line `serve` execs into. Pure, so it can be tested.
+
+    `respawn` matters: without --respawn-failed-workers Granian's master EXITS the
+    moment any one worker dies (measured: kill -9 one of four workers and the master
+    is gone within half a second, taking the other three with it). One out-of-memory
+    kill then means a full outage until the supervisor above restarts everything. With
+    it, the survivors keep answering and the dead worker is replaced after
+    RESPAWN_INTERVAL_SECONDS."""
+    argv = [
+        granian_bin,
+        "--interface",
+        "asgi",
+        target,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--workers",
+        str(workers),
+    ]
+    if respawn:
+        argv += ["--respawn-failed-workers", "--respawn-interval", str(RESPAWN_INTERVAL_SECONDS)]
+    if reload:
+        argv.append("--reload")
+    return argv
+
+
 @app.command()
 def serve(
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8000, "--port"),
     workers: int = typer.Option(1, "--workers"),
     reload: bool = typer.Option(False, "--reload", help="Restart on source changes (dev only)."),
+    respawn: bool = typer.Option(
+        True,
+        "--respawn/--no-respawn",
+        help="Replace a worker process that dies, instead of shutting the whole server down "
+        "(default on).",
+    ),
     target: str = typer.Option(
         "gateway._asgi_entrypoint:app",
         "--app",
@@ -74,20 +121,9 @@ def serve(
         )
         raise typer.Exit(code=1)
 
-    argv = [
-        granian_bin,
-        "--interface",
-        "asgi",
-        target,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--workers",
-        str(workers),
-    ]
-    if reload:
-        argv.append("--reload")
+    argv = build_granian_argv(
+        granian_bin, target, host=host, port=port, workers=workers, reload=reload, respawn=respawn
+    )
 
     console.print(f"[dim]$ {' '.join(argv)}[/dim]")
     # execvp: a candidate containing "/" (the resolved sibling path always
