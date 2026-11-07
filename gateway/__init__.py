@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 import arc
+from arc.settings import SettingsError
 
 from .middleware import (
     DEFAULT_ACCESS_LOG_MODE,
@@ -43,6 +44,9 @@ from .middleware import (
     access_log_middleware,
     apply_access_log_mode,
     check_rate_limit,
+    in_networks,
+    parse_networks,
+    rate_limit_exempt,
     client_ip_middleware,
     cors_middleware,
     csrf_middleware,
@@ -109,6 +113,7 @@ ACCESS_LOG_KEY = "gateway_access_log"
 RATE_LIMIT_ENABLED_KEY = "gateway_rate_limit_enabled"
 RATE_LIMIT_REQUESTS_KEY = "gateway_rate_limit_requests"
 RATE_LIMIT_WINDOW_SECONDS_KEY = "gateway_rate_limit_window_seconds"
+RATE_LIMIT_EXEMPT_KEY = "gateway_rate_limit_exempt"
 
 METRICS_TOKEN_KEY = "gateway_metrics_token"
 # Deliberately a PLAIN setting, not secret=True: a scrape credential read
@@ -243,9 +248,13 @@ class GatewayProvider:
         rate_limit_enabled: bool = True,
         rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
         rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+        rate_limit_exempt: list | None = None,
         access_log: str = DEFAULT_ACCESS_LOG_MODE,
     ) -> None:
         self._kernel = kernel
+        #: Networks whose anonymous traffic is not counted by the per-IP request limit (and which
+        #: authn does not hold to its failed-login budget): see rate_limit_exempt() in middleware.py.
+        self._rate_limit_exempt = tuple(rate_limit_exempt or ())
         # Validates `access_log` (raises on an unknown value) and routes the
         # access lines: off the console unless access_log == "console".
         apply_access_log_mode(access_log)
@@ -321,6 +330,7 @@ class GatewayProvider:
                 limit=rate_limit_requests,
                 window_seconds=rate_limit_window_seconds,
                 fallback=self._rate_limit_fallback,
+                exempt_networks=self._rate_limit_exempt,
             ),
         ]
 
@@ -717,6 +727,12 @@ class GatewayProvider:
         else:
             await send_json(send, 500, {"error": "internal server error"})
 
+    def is_rate_limit_exempt(self, client_ip: str | None) -> bool:
+        """Is `client_ip` in a network listed in `gateway_rate_limit_exempt`? The list of networks an
+        operator trusts not to be throttled per address; authn asks this too, so that one office
+        listed once is exempt from both the request limit and the failed-login budget."""
+        return in_networks(client_ip, self._rate_limit_exempt)
+
     async def _send_unavailable(self, send: Callable, exc: Exception, method: str, path: str) -> None:
         """An exception that says of itself `http_status = 503` (pgdb's PoolExhausted: no database
         connection was available) is capacity, not a bug: tell the caller to come back, with
@@ -1033,7 +1049,7 @@ class GatewayProvider:
         # from (rate_limit_key returns the identical string either way):
         # one shared "how many things is this caller starting" counter
         # per identity/IP, not a separate invented pool just for WS.
-        if self._rate_limit_enabled:
+        if self._rate_limit_enabled and not rate_limit_exempt(identity, client_ip, self._rate_limit_exempt):
             allowed = await check_rate_limit(
                 self._kernel,
                 self._rate_limit_fallback,
@@ -1066,6 +1082,8 @@ class GatewayProvider:
             # connections you've opened" and "how many messages you've
             # sent on an already-open one" would let a single active chat
             # session exhaust the same pool a fresh page load draws from.
+            if rate_limit_exempt(identity, client_ip, self._rate_limit_exempt):
+                return True
             return await check_rate_limit(
                 self._kernel,
                 self._rate_limit_fallback,
@@ -1350,6 +1368,15 @@ def register(kernel: Any) -> None:
         doc="Rate-limit window length, in seconds.",
     )
     kernel.settings.declare(
+        RATE_LIMIT_EXEMPT_KEY,
+        doc="Networks (comma-separated IP addresses or CIDR ranges, e.g. '203.0.113.0/24,10.1.2.3') "
+        "whose ANONYMOUS traffic is not counted by the per-IP request limit - an office of "
+        "hundreds behind one public address otherwise shares one budget of "
+        "gateway_rate_limit_requests - and which authn does not hold to its failed-login budget. "
+        "Signed-in users keep their own per-user limit. The address is the one the gateway sees: "
+        "set gateway_trusted_proxies first when running behind nginx, or it is nginx's own.",
+    )
+    kernel.settings.declare(
         MAINTENANCE_MODE_KEY,
         type=bool,
         default=False,
@@ -1398,6 +1425,17 @@ def register(kernel: Any) -> None:
         [p.strip() for p in raw_proxies.split(",") if p.strip()] if raw_proxies else None
     )
 
+    try:
+        exempt_networks = parse_networks(RATE_LIMIT_EXEMPT_KEY, kernel.settings.get(RATE_LIMIT_EXEMPT_KEY))
+    except ValueError as exc:
+        raise SettingsError(str(exc)) from exc
+    if exempt_networks and not trusted_proxies:
+        kernel.advise(
+            f"gateway: {RATE_LIMIT_EXEMPT_KEY} is set but gateway_trusted_proxies is not, so the address "
+            f"checked against it is the immediate peer's - behind nginx that is nginx itself, and the "
+            f"exemption would match nobody (or, if 127.0.0.1 is listed, everybody). Set "
+            f"gateway_trusted_proxies to the proxy's address."
+        )
     provider = GatewayProvider(
         kernel,
         cors_origins=cors_origins,
@@ -1411,6 +1449,7 @@ def register(kernel: Any) -> None:
         rate_limit_enabled=kernel.settings.get(RATE_LIMIT_ENABLED_KEY),
         rate_limit_requests=kernel.settings.get(RATE_LIMIT_REQUESTS_KEY),
         rate_limit_window_seconds=kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY),
+        rate_limit_exempt=exempt_networks,
         access_log=kernel.settings.get(ACCESS_LOG_KEY),
     )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=["authn", "redix"])

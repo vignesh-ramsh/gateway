@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 import re
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any, Awaitable, Callable
 
 from .request import cookies_from_scope, get_header, headers_from_scope, send_json
@@ -780,6 +782,48 @@ async def check_rate_limit(
     return await fallback.allow(key, limit, window_seconds)
 
 
+Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def parse_networks(setting: str, text: str | None) -> list[Network]:
+    """A comma-separated setting of IP addresses or CIDR ranges, e.g. `203.0.113.0/24,10.1.2.3`.
+    Raises ValueError naming the setting and the entry that is not one."""
+    networks: list[Network] = []
+    for item in (text or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            raise ValueError(
+                f"{setting}: {item!r} is not an IP address or CIDR range "
+                f"(expected e.g. 203.0.113.7 or 10.0.0.0/24)"
+            ) from None
+    return networks
+
+
+def in_networks(client_ip: str | None, networks: Sequence[Network]) -> bool:
+    """Is `client_ip` inside one of `networks`? Anything that is not an address is not."""
+    if not networks or not client_ip:
+        return False
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return any(address in network for network in networks)
+
+
+def rate_limit_exempt(identity: Any, client_ip: str | None, networks: Sequence[Network]) -> bool:
+    """Anonymous traffic from a trusted network is not counted against the per-IP budget: an
+    office of hundreds behind one public address would otherwise share one budget of 300 requests
+    a minute, which loading a login page for each of them uses up. Only the IP-keyed budget is
+    skipped: once someone is signed in the limit is theirs, per user, wherever they are."""
+    if getattr(identity, "user_id", None):
+        return False
+    return in_networks(client_ip, networks)
+
+
 def rate_limit_middleware(
     kernel: Any,
     *,
@@ -787,6 +831,7 @@ def rate_limit_middleware(
     limit: int,
     window_seconds: int,
     fallback: LocalRateLimiter,
+    exempt_networks: Sequence[Network] = (),
 ) -> Middleware:
     """Innermost of every builtin middleware (see gateway/__init__.py's own
     composition comment) — deliberately positioned so access_log_middleware
@@ -821,6 +866,8 @@ def rate_limit_middleware(
                 return await app(scope, receive, send)
 
             state = scope.get("state", {})
+            if rate_limit_exempt(state.get("arc_identity"), state.get("arc_client_ip"), exempt_networks):
+                return await app(scope, receive, send)
             key = rate_limit_key(state.get("arc_identity"), state.get("arc_client_ip"))
             allowed = await check_rate_limit(kernel, fallback, key, limit, window_seconds)
 
