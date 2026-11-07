@@ -151,6 +151,7 @@ class Request:
     client_ip: str | None = None  # set by client_ip_middleware — proxy-aware if
     # trusted_proxies is configured, raw scope["client"]
     # otherwise
+    json_limit: int | None = None  # largest body json() will decode; None = no limit of its own
     cookies: dict[str, str] = field(default_factory=dict)  # parsed from the Cookie header
     request_id: str | None = None  # set by request_id_middleware — one correlation id
     # per request, echoed back as the X-Request-ID
@@ -159,6 +160,11 @@ class Request:
     # enqueues can be traced back to it)
 
     def json(self, schema: Any | None = None) -> Any:
+        """The body decoded as JSON (and validated against `schema` when given). Raises HTTPError 413
+        for a body over `json_limit`, without decoding it: decoding runs on the event loop and holds
+        the GIL, so its cost is every other request's wait. Raises arc.codec.CodecError for bad JSON."""
+        if self.json_limit is not None and len(self.body) > self.json_limit:
+            raise HTTPError(413, {"error": "JSON body too large", "limit_bytes": self.json_limit})
         if schema is not None:
             return arc.codec.decode(self.body, type=schema)
         return arc.codec.decode(self.body)

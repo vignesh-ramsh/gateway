@@ -107,6 +107,14 @@ FORWARDED_HEADER_KEY = "gateway_forwarded_header"
 MAX_BODY_BYTES_KEY = "gateway_max_body_bytes"
 DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB — generous for a JSON API body,
 # nowhere near "unbounded" (the bug this fixes)
+#: The largest JSON body that is DECODED, on any route. Decoding
+#: runs on the event loop and holds the GIL, so it stalls every other request on that worker for as
+#: long as it takes: measured at about 7 ms per MB of ordinary object-heavy JSON (10 MB: 71 ms to
+#: decode, an 80 ms pause). Moving it to a thread or another process does not help (the thread still
+#: holds the GIL: a 60 ms pause; a process pool: 66 ms and slower overall), so the work is bounded
+#: instead. 0 turns this ceiling off, leaving only `gateway_max_body_bytes`.
+MAX_JSON_BODY_BYTES_KEY = "gateway_max_json_body_bytes"
+DEFAULT_MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
 
 ACCESS_LOG_KEY = "gateway_access_log"
 
@@ -245,6 +253,7 @@ class GatewayProvider:
         trusted_proxies: list[str] | None = None,
         forwarded_header: str = "X-Forwarded-For",
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        max_json_body_bytes: int | None = DEFAULT_MAX_JSON_BODY_BYTES,
         rate_limit_enabled: bool = True,
         rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
         rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
@@ -268,6 +277,7 @@ class GatewayProvider:
         self._trusted_proxies = trusted_proxies or []
         self._forwarded_header = forwarded_header
         self._max_body_bytes = max_body_bytes
+        self._max_json_body_bytes = max_json_body_bytes or None
         self._metrics = RequestMetrics()
         self._readiness = ReadinessProbe(kernel)
         self._rate_limit_fallback = LocalRateLimiter()
@@ -641,6 +651,25 @@ class GatewayProvider:
     def routes(self) -> list:
         return self._router.all_routes()
 
+    def proxy_facts(self) -> dict:
+        """What a reverse proxy in front of this gateway needs to know, as plain data: the body
+        ceiling that applies to every route without its own, and per route its method, path, own
+        body ceiling (None = the shared one) and whether it is a WebSocket. `arc deploy prod` reads
+        this (through `arc gateway routes --json`) to write nginx limits and timeouts per route,
+        so the proxy cannot drift from what the routes actually declare."""
+        return {
+            "max_body_bytes": self._max_body_bytes,
+            "routes": [
+                {
+                    "method": route.method,
+                    "path": route.path,
+                    "max_body_bytes": route.max_body_bytes,
+                    "websocket": route.method == WEBSOCKET_METHOD,
+                }
+                for route in self._router.all_routes()
+            ],
+        }
+
     def openapi_spec(self) -> dict:
         return build_openapi_spec(self._router.all_routes())
 
@@ -706,7 +735,7 @@ class GatewayProvider:
         return app
 
     async def _send_unhandled_exception(
-        self, send: Callable, scope: dict, exc: Exception, method: str, path: str
+        self, send: Callable, scope: dict, exc: Exception, method: str, path: str, route: str | None = None
     ) -> None:
         """The single place _dispatch sends a 500 for a genuine bug rather
         than a client mistake — always logged server-side, in full,
@@ -719,6 +748,17 @@ class GatewayProvider:
         exception type/message/traceback instead, with known secrets
         redacted and file paths shortened to the project root first."""
         _logger.exception("unhandled exception in %s %s", method, path)
+        # Counted, fingerprinted and (when configured) sent to the error tracker. The route TEMPLATE
+        # (`/employee/{id}/documents`), never the raw path: ids in a path are data, and grouping needs
+        # one value per route.
+        arc.errors.capture(
+            exc,
+            source="gateway",
+            method=method,
+            route=route or "-",
+            status=500,
+            request_id=scope.get("state", {}).get("arc_request_id"),
+        )
         identity = scope.get("state", {}).get("arc_identity")
         if _caller_gets_debug_detail(self._kernel, identity):
             raw = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
@@ -826,11 +866,17 @@ class GatewayProvider:
             client_ip=scope.get("state", {}).get("arc_client_ip"),
             cookies=cookies_from_scope(scope),
             request_id=scope.get("state", {}).get("arc_request_id"),
+            # What may be DECODED as JSON is bounded on every route, including one whose own ceiling
+            # lets big uploads through: a large attachment never meant a large JSON payload.
+            json_limit=self._max_json_body_bytes,
         )
 
         if route.request_schema is not None and route.validate_body:
             try:
                 request.validated = request.json(route.request_schema)
+            except HTTPError as exc:
+                await send_error(send, scope, exc.status_code, exc.detail)
+                return
             except Exception as exc:
                 await send_json(send, 422, {"error": "validation failed", "detail": str(exc)})
                 return
@@ -844,13 +890,13 @@ class GatewayProvider:
             if getattr(exc, "http_status", None) == 503:
                 await self._send_unavailable(send, exc, method, path)
             else:
-                await self._send_unhandled_exception(send, scope, exc, method, path)
+                await self._send_unhandled_exception(send, scope, exc, method, path, route.path)
             return
 
         if isinstance(result, StreamResponse):
             try:
                 await send_stream(send, result)
-            except Exception:
+            except Exception as stream_exc:
                 # http.response.start (status 200) is already sent by this
                 # point — there is no way to change status code mid-stream,
                 # so the best this can do is log server-side (same as the
@@ -859,6 +905,14 @@ class GatewayProvider:
                 # reading the stream sees a truncated/errored feed either
                 # way, which is itself the signal something went wrong.
                 _logger.exception("unhandled exception while streaming %s %s", method, path)
+                arc.errors.capture(
+                    stream_exc,
+                    source="gateway",
+                    method=method,
+                    route=route.path,
+                    stage="stream",
+                    request_id=scope.get("state", {}).get("arc_request_id"),
+                )
                 try:
                     await send(
                         {
@@ -945,7 +999,7 @@ class GatewayProvider:
             # (a broken client connection, not a serialization bug) can
             # still raise a second time out of this handler, same as
             # before this existed.
-            await self._send_unhandled_exception(send, scope, exc, method, path)
+            await self._send_unhandled_exception(send, scope, exc, method, path, route.path)
 
     async def _dispatch_websocket(self, scope: dict, receive: Callable, send: Callable) -> None:
         """Handshake -> roles/origin check -> handler, in that order —
@@ -1025,7 +1079,7 @@ class GatewayProvider:
         resolve = getattr(authn_provider, "resolve_identity", None)
         try:
             identity = await resolve(scope) if callable(resolve) else None
-        except Exception:
+        except Exception as identity_exc:
             # Same "fail closed to unauthenticated, log server-side"
             # posture identity_middleware's own docstring documents at
             # length for the identical failure — an infrastructure error
@@ -1033,6 +1087,7 @@ class GatewayProvider:
             _logger.exception(
                 "identity resolution raised during a WS handshake — treating as unauthenticated"
             )
+            arc.errors.capture(identity_exc, source="gateway", stage="identity", method="WEBSOCKET")
             identity = None
 
         client_ip = resolve_client_ip(
@@ -1106,7 +1161,7 @@ class GatewayProvider:
         )
         try:
             await route.handler(connection)
-        except Exception:
+        except Exception as handler_exc:
             # Same "never let it escape unstructured to Granian" posture
             # _dispatch's own catch-all uses for an HTTP handler — a
             # WebSocket has no status code to report a 500 with at this
@@ -1114,6 +1169,10 @@ class GatewayProvider:
             # long since succeeded), so the best available signal is an
             # abnormal close code plus a server-side traceback.
             _logger.exception("unhandled exception in WS handler for %s", path)
+            arc.errors.capture(
+                handler_exc, source="gateway", method="WEBSOCKET", route=route.path, stage="websocket",
+                request_id=connection.request_id,
+            )
             await connection.close(1011)  # 1011 Internal Error
         finally:
             await connection.close()
@@ -1336,6 +1395,15 @@ def register(kernel: Any) -> None:
         doc="Global request body size ceiling, in bytes.",
     )
     kernel.settings.declare(
+        MAX_JSON_BODY_BYTES_KEY,
+        type=int,
+        default=DEFAULT_MAX_JSON_BODY_BYTES,
+        doc="Largest JSON request body, in bytes, that is decoded (413 above it), on every route: "
+        "a route's own max_body_bytes lets big uploads in, not big JSON. Decoding runs on the event loop and costs about 7 ms per MB, "
+        "pausing every other request on that worker meanwhile. 0 = no separate ceiling "
+        "(gateway_max_body_bytes applies). Restart to apply.",
+    )
+    kernel.settings.declare(
         ACCESS_LOG_KEY,
         default=DEFAULT_ACCESS_LOG_MODE,
         doc="Where each request's access line goes: 'file' (default; only "
@@ -1436,6 +1504,11 @@ def register(kernel: Any) -> None:
             f"exemption would match nobody (or, if 127.0.0.1 is listed, everybody). Set "
             f"gateway_trusted_proxies to the proxy's address."
         )
+    max_json_body_bytes = kernel.settings.get(MAX_JSON_BODY_BYTES_KEY)
+    if max_json_body_bytes < 0:
+        raise SettingsError(
+            f"{MAX_JSON_BODY_BYTES_KEY}: {max_json_body_bytes} is not a size in bytes (use 0 for no separate ceiling)."
+        )
     provider = GatewayProvider(
         kernel,
         cors_origins=cors_origins,
@@ -1446,6 +1519,7 @@ def register(kernel: Any) -> None:
         trusted_proxies=trusted_proxies,
         forwarded_header=kernel.settings.get(FORWARDED_HEADER_KEY),
         max_body_bytes=kernel.settings.get(MAX_BODY_BYTES_KEY),
+        max_json_body_bytes=max_json_body_bytes,
         rate_limit_enabled=kernel.settings.get(RATE_LIMIT_ENABLED_KEY),
         rate_limit_requests=kernel.settings.get(RATE_LIMIT_REQUESTS_KEY),
         rate_limit_window_seconds=kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY),

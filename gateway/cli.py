@@ -8,6 +8,7 @@ and redix.cli.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -144,6 +145,13 @@ def routes(
         "convention as `serve --app`. Without it, only routes registered "
         "by arc.boot() itself are shown.",
     ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Print what a reverse proxy needs (the shared body limit, and each route's method, "
+        "path, own body limit and whether it is a WebSocket) as one line of JSON, nothing else "
+        "on stdout. `arc deploy prod` reads this to write nginx limits per route.",
+    ),
 ) -> None:
     """List every route currently registered on arc.gateway."""
     root = find_project_root()
@@ -159,6 +167,11 @@ def routes(
             importlib.import_module(app_module)  # expected to call arc.boot() itself
         else:
             arc.boot()
+
+    if as_json:
+        # raw write, not console.print: Rich would wrap a long line and treat [brackets] as markup
+        sys.stdout.write(json.dumps(arc.gateway.proxy_facts(), separators=(",", ":")) + "\n")
+        return
 
     table = Table()
     table.add_column("Method")

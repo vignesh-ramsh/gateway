@@ -621,7 +621,7 @@ def identity_middleware(kernel: Any) -> Middleware:
             resolve = getattr(authn_provider, "resolve_identity", None)
             try:
                 identity = await resolve(scope) if callable(resolve) else None
-            except Exception:
+            except Exception as identity_exc:
                 # resolve_identity's contract is "None, never raise" for
                 # AUTH failures — but an infrastructure failure inside it
                 # (Redis down, DB pool exhausted) used to escape here, past
@@ -633,6 +633,17 @@ def identity_middleware(kernel: Any) -> Middleware:
                 # cache errors to DB reads so this branch is a last resort.
                 _logger.exception(
                     "identity resolution raised — treating request as unauthenticated"
+                )
+                # Swallowed on purpose (fail closed), which is exactly why it must be counted: with
+                # Redis down every signed-in user silently becomes anonymous.
+                import arc  # gateway has no module-level arc import here, same lazy-import posture as elsewhere
+
+                arc.errors.capture(
+                    identity_exc,
+                    source="gateway",
+                    stage="identity",
+                    method=scope.get("method", "-"),
+                    request_id=scope.get("state", {}).get("arc_request_id"),
                 )
                 identity = None
             scope = {**scope, "state": {**scope.get("state", {}), "arc_identity": identity}}
