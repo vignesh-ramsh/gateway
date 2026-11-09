@@ -243,7 +243,14 @@ def query_params_from_scope(scope: dict) -> dict[str, list[str]]:
     return parse_qs(raw.decode("latin-1"), keep_blank_values=True)
 
 
+class EncodedJSON(bytes):
+    """JSON that is already encoded. Return one from a handler (or hand one to send_json) to have it sent
+    as it is, with no second encode: for a document that is built once and served many times."""
+
+
 def encode_json(value: Any) -> bytes:
+    if isinstance(value, EncodedJSON):
+        return value
     return arc.codec.encode(value)
 
 

@@ -37,7 +37,9 @@ from urllib.parse import urlsplit
 import arc
 from arc.settings import SettingsError
 
+from . import bodies as _bodies
 from . import middleware as _middleware
+from .bodies import EARLY_AUTH_BODY_BYTES, BodyBudget, BodyBudgetBusy, body_size_hint, serve_and_drain
 from .middleware import (
     DEFAULT_ACCESS_LOG_MODE,
     LocalRateLimiter,
@@ -65,6 +67,7 @@ from .health import HEALTH_PATHS, ReadinessProbe
 from .health import serve as serve_health
 from .openapi import build_openapi_spec, render_openapi_css, render_openapi_html
 from .request import (
+    EncodedJSON,
     HTTPError,
     Request,
     Response,
@@ -116,6 +119,14 @@ DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB — generous for a JSON API b
 #: instead. 0 turns this ceiling off, leaving only `gateway_max_body_bytes`.
 MAX_JSON_BODY_BYTES_KEY = "gateway_max_json_body_bytes"
 DEFAULT_MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+
+#: The most bytes of request bodies one web worker holds in memory at once (those over 64 KB; smaller
+#: ones are not counted). A body is read whole before its handler runs, so without a bound a crowd of big
+#: uploads is a crowd of big allocations: four anonymous 59 MB uploads took a worker from 425 to 594 MB
+#: (about 0.7 MB of memory per MB of body). Requests beyond it wait briefly, then get 503 + Retry-After.
+#: 0 = no bound.
+MAX_INFLIGHT_BODY_BYTES_KEY = "gateway_max_inflight_body_bytes"
+DEFAULT_MAX_INFLIGHT_BODY_BYTES = 256 * 1024 * 1024
 
 ACCESS_LOG_KEY = "gateway_access_log"
 
@@ -255,6 +266,7 @@ class GatewayProvider:
         forwarded_header: str = "X-Forwarded-For",
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
         max_json_body_bytes: int | None = DEFAULT_MAX_JSON_BODY_BYTES,
+        max_inflight_body_bytes: int = DEFAULT_MAX_INFLIGHT_BODY_BYTES,
         rate_limit_enabled: bool = True,
         rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
         rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
@@ -279,6 +291,9 @@ class GatewayProvider:
         self._forwarded_header = forwarded_header
         self._max_body_bytes = max_body_bytes
         self._max_json_body_bytes = max_json_body_bytes or None
+        self._body_budget = BodyBudget(max_inflight_body_bytes, wait_seconds=_bodies.BUDGET_WAIT_SECONDS)
+        # OpenAPI documents built from the route table, kept until a route is added: name -> (generation, document)
+        self._documents: dict[str, tuple[int, Any]] = {}
         self._metrics = RequestMetrics()
         self._readiness = ReadinessProbe(kernel)
         self._rate_limit_fallback = LocalRateLimiter()
@@ -384,6 +399,7 @@ class GatewayProvider:
         etag: bool = False,
         plugin: str | None = None,
         roles: frozenset[str] | None = None,
+        authorize: Callable[[Any], None] | None = None,
     ) -> None:
         """Register a route. Relay (Phase 3) will call this the same way any
         other caller does — Gateway never hardcodes knowledge of Resources.
@@ -447,7 +463,13 @@ class GatewayProvider:
         dispatch reads this field. Only a WebSocket route (add_ws_route)
         actually enforces it, at handshake time. Populated here so the
         /openapi UI can show "allowed roles" per route without a second,
-        parallel channel for the same information."""
+        parallel channel for the same information.
+
+        `authorize`: the route's own check of who may call it, called with a Request whose body is still
+        empty and raising HTTPError to refuse. The gateway runs it before it reads a large request body
+        (a declared 64 KB or more, or no declared length), so a caller who would be refused anyway does
+        not get a worker to hold their upload in memory first. The route's handler must still do its
+        own check: this one is early, not instead."""
         first_segment = next((s for s in path.strip("/").split("/") if s), None)
         if first_segment is not None and first_segment in self._spa_mounts:
             raise RouterError(
@@ -467,6 +489,7 @@ class GatewayProvider:
             etag=etag,
             plugin=plugin,
             roles=roles,
+            authorize=authorize,
         )
         self._built_app = None
 
@@ -674,6 +697,18 @@ class GatewayProvider:
     def openapi_spec(self) -> dict:
         return build_openapi_spec(self._router.all_routes())
 
+    def _document(self, name: str, build: Callable[[], Any]) -> Any:
+        """A document made from the route table (the OpenAPI JSON and page): built the first time it is
+        asked for after a route was added, and kept until the next one. They are open to anyone, and
+        rebuilding one for every request cost about 4.6 ms of CPU on a site with 205 routes - 450 requests
+        a second used up both web workers."""
+        generation = self._router.generation
+        cached = self._documents.get(name)
+        if cached is None or cached[0] != generation:
+            cached = (generation, build())
+            self._documents[name] = cached
+        return cached[1]
+
     async def health(self) -> dict:
         """Reports on gateway itself ONLY — same as every other capability's
         health(). This used to walk and re-aggregate every OTHER capability
@@ -704,6 +739,10 @@ class GatewayProvider:
             # rate-limit checks redix could not answer, decided from this process's own counter instead
             # (redix down, or its connection pool full) - looked up on the module so it is always the live one
             "rate_limit_fallbacks_total": _middleware.RATE_LIMIT_FALLBACKS.total,
+            # request bodies (over 64 KB) in memory now, waiting for room, and refused for lack of it
+            "inflight_body_bytes": self._body_budget.in_flight,
+            "inflight_body_waiting": self._body_budget.waiting,
+            "inflight_body_rejected_total": self._body_budget.rejected_total,
         }
 
     # ------------------------------------------------------------------ #
@@ -727,7 +766,9 @@ class GatewayProvider:
             # metrics, takes no rate-limit slot, and gets its answer under maintenance mode too.
             return await serve_health(scope, send, self._readiness)
         app = self._compiled_app()
-        await app(scope, receive, send)
+        # Whatever the app leaves of a request body (it replied early: 429, 403, 404) is read and discarded
+        # once the reply is out, or nginx, still sending it, fails with EPIPE and answers 502 instead.
+        await serve_and_drain(app, scope, receive, send)
 
     def _compiled_app(self) -> ASGIApp:
         if self._built_app is not None:
@@ -796,6 +837,15 @@ class GatewayProvider:
         )
 
     async def _dispatch(self, scope: dict, receive: Callable, send: Callable) -> None:
+        """Route the request, then give back whatever it reserved of the request-body budget, however it
+        ended (an answer, an error, the client going away)."""
+        reservation = [0]
+        try:
+            await self._dispatch_routed(scope, receive, send, reservation)
+        finally:
+            self._body_budget.release(reservation[0])
+
+    async def _dispatch_routed(self, scope: dict, receive: Callable, send: Callable, reservation: list[int]) -> None:
         method = scope["method"]
         path = scope["path"]
 
@@ -854,28 +904,45 @@ class GatewayProvider:
             return
 
         route = match.route
+        ceiling = route.max_body_bytes or self._max_body_bytes
+
+        def build_request(body: bytes) -> Request:
+            return Request(
+                method=method,
+                path=path,
+                path_params=match.params,
+                query_params=query_params_from_scope(scope),
+                headers=headers_from_scope(scope),
+                body=body,
+                scope=scope,
+                identity=scope.get("state", {}).get("arc_identity"),
+                client_ip=scope.get("state", {}).get("arc_client_ip"),
+                cookies=cookies_from_scope(scope),
+                request_id=scope.get("state", {}).get("arc_request_id"),
+                # What may be DECODED as JSON is bounded on every route, including one whose own ceiling
+                # lets big uploads through: a large attachment never meant a large JSON payload.
+                json_limit=self._max_json_body_bytes,
+            )
+
         try:
-            body = await read_body(receive, max_bytes=route.max_body_bytes or self._max_body_bytes)
+            hint = body_size_hint(scope, ceiling=ceiling)
+            if route.authorize is not None and hint >= EARLY_AUTH_BODY_BYTES:
+                # A caller who would be refused anyway is refused before a worker holds their upload in memory.
+                route.authorize(build_request(b""))
+            # Counted against what this worker may hold at once; waits briefly for room, then 503.
+            reservation[0] = await self._body_budget.reserve(hint)
+            body = await read_body(receive, max_bytes=ceiling)
         except HTTPError as exc:
             await send_error(send, scope, exc.status_code, exc.detail)
             return
+        except BodyBudgetBusy as exc:
+            await self._send_unavailable(send, exc, method, path)
+            return
+        except Exception as exc:
+            await self._send_unhandled_exception(send, scope, exc, method, path, route.path)
+            return
 
-        request = Request(
-            method=method,
-            path=path,
-            path_params=match.params,
-            query_params=query_params_from_scope(scope),
-            headers=headers_from_scope(scope),
-            body=body,
-            scope=scope,
-            identity=scope.get("state", {}).get("arc_identity"),
-            client_ip=scope.get("state", {}).get("arc_client_ip"),
-            cookies=cookies_from_scope(scope),
-            request_id=scope.get("state", {}).get("arc_request_id"),
-            # What may be DECODED as JSON is bounded on every route, including one whose own ceiling
-            # lets big uploads through: a large attachment never meant a large JSON payload.
-            json_limit=self._max_json_body_bytes,
-        )
+        request = build_request(body)
 
         if route.request_schema is not None and route.validate_body:
             try:
@@ -1286,15 +1353,16 @@ class GatewayProvider:
 
     # ------------------------------------------------------------------ #
     def _register_builtin_routes(self) -> None:
-        async def _openapi_handler(request: Request) -> dict:
-            return self.openapi_spec()
+        async def _openapi_handler(request: Request) -> EncodedJSON:
+            # Encoded once with the document; etag=True below lets a client that has it get a 304.
+            return self._document("openapi.json", lambda: EncodedJSON(encode_json(self.openapi_spec())))
 
         self._router.add_route(
-            "GET", "/openapi.json", _openapi_handler, summary="OpenAPI 3.0 document"
+            "GET", "/openapi.json", _openapi_handler, summary="OpenAPI 3.0 document", etag=True
         )
 
         async def _openapi_ui_handler(request: Request) -> Response:
-            text = render_openapi_html(self._router.all_routes())
+            text = self._document("openapi.html", lambda: render_openapi_html(self._router.all_routes()))
             return Response(content=text, media_type="text/html; charset=utf-8")
 
         self._router.add_route(
@@ -1302,7 +1370,7 @@ class GatewayProvider:
         )
 
         async def _openapi_css_handler(request: Request) -> Response:
-            return Response(content=render_openapi_css(), media_type="text/css; charset=utf-8")
+            return Response(content=self._document("openapi.css", render_openapi_css), media_type="text/css; charset=utf-8")
 
         self._router.add_route(
             "GET", "/openapi.css", _openapi_css_handler, summary="Stylesheet for /openapi"
@@ -1410,6 +1478,16 @@ def register(kernel: Any) -> None:
         "(gateway_max_body_bytes applies). Restart to apply.",
     )
     kernel.settings.declare(
+        MAX_INFLIGHT_BODY_BYTES_KEY,
+        type=int,
+        default=DEFAULT_MAX_INFLIGHT_BODY_BYTES,
+        doc="Most bytes of request bodies (those over 64 KB) one web worker holds in memory at once, "
+        "default 256 MiB, 0 = no bound. A body is read whole before its handler runs, so a crowd of big "
+        "uploads is a crowd of big allocations (about 0.7 MB of memory per MB of body). A request that does "
+        "not fit waits up to 5 s for room, then gets 503 with Retry-After; one bigger than the whole bound "
+        "is let in alone. Restart to apply.",
+    )
+    kernel.settings.declare(
         ACCESS_LOG_KEY,
         default=DEFAULT_ACCESS_LOG_MODE,
         doc="Where each request's access line goes: 'file' (default; only "
@@ -1515,6 +1593,11 @@ def register(kernel: Any) -> None:
         raise SettingsError(
             f"{MAX_JSON_BODY_BYTES_KEY}: {max_json_body_bytes} is not a size in bytes (use 0 for no separate ceiling)."
         )
+    max_inflight_body_bytes = kernel.settings.get(MAX_INFLIGHT_BODY_BYTES_KEY)
+    if max_inflight_body_bytes < 0:
+        raise SettingsError(
+            f"{MAX_INFLIGHT_BODY_BYTES_KEY}: {max_inflight_body_bytes} is not a size in bytes (use 0 for no bound)."
+        )
     provider = GatewayProvider(
         kernel,
         cors_origins=cors_origins,
@@ -1526,6 +1609,7 @@ def register(kernel: Any) -> None:
         forwarded_header=kernel.settings.get(FORWARDED_HEADER_KEY),
         max_body_bytes=kernel.settings.get(MAX_BODY_BYTES_KEY),
         max_json_body_bytes=max_json_body_bytes,
+        max_inflight_body_bytes=max_inflight_body_bytes,
         rate_limit_enabled=kernel.settings.get(RATE_LIMIT_ENABLED_KEY),
         rate_limit_requests=kernel.settings.get(RATE_LIMIT_REQUESTS_KEY),
         rate_limit_window_seconds=kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY),

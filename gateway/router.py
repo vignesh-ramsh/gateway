@@ -123,6 +123,10 @@ class RouteEntry:
     # plugin, already tracked there for its own error messages), so this
     # stays None unless relay's own _wire_gateway_route sets it explicitly.
     plugin: str | None = None
+    # The route's own check of who may call it, run by the gateway BEFORE it reads a large request body:
+    # called with a Request (its body empty) and raises HTTPError to refuse. Relay passes the role check
+    # it runs again inside `handler`; None (a route registered by anyone else) means no early check.
+    authorize: Callable[[Any], None] | None = None
 
 
 @dataclass
@@ -158,6 +162,9 @@ def _split_path(path: str) -> list[str]:
 class Router:
     def __init__(self) -> None:
         self._root = _Node()
+        #: Counts changes to the route table, so a document built from it (the OpenAPI ones) knows when
+        #: it is out of date.
+        self.generation = 0
 
     def _ensure_node(self, path: str) -> _Node:
         node = self._root
@@ -196,6 +203,7 @@ class Router:
         etag: bool = False,
         plugin: str | None = None,
         roles: frozenset[str] | None = None,
+        authorize: Callable[[Any], None] | None = None,
     ) -> None:
         method = method.upper()
         node = self._ensure_node(path)
@@ -214,7 +222,9 @@ class Router:
             etag=etag,
             plugin=plugin,
             roles=roles,
+            authorize=authorize,
         )
+        self.generation += 1
 
     def add_ws_route(
         self,
@@ -234,6 +244,7 @@ class Router:
             summary=summary,
             roles=roles,
         )
+        self.generation += 1
 
     def match(self, method: str, path: str) -> MatchResult:
         method = method.upper()
