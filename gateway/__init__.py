@@ -37,6 +37,7 @@ from urllib.parse import urlsplit
 import arc
 from arc.settings import SettingsError
 
+from . import middleware as _middleware
 from .middleware import (
     DEFAULT_ACCESS_LOG_MODE,
     LocalRateLimiter,
@@ -698,7 +699,12 @@ class GatewayProvider:
         counters since it started; arc.metrics' own exporter/aggregate()
         machinery is what turns every worker's own call to this into one
         cross-process picture at /metrics, not this method itself."""
-        return self._metrics.metrics()
+        return {
+            **self._metrics.metrics(),
+            # rate-limit checks redix could not answer, decided from this process's own counter instead
+            # (redix down, or its connection pool full) - looked up on the module so it is always the live one
+            "rate_limit_fallbacks_total": _middleware.RATE_LIMIT_FALLBACKS.total,
+        }
 
     # ------------------------------------------------------------------ #
     # ASGI 3.0 entrypoint

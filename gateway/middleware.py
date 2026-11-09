@@ -774,6 +774,48 @@ def rate_limit_key(identity: Any, client_ip: str | None) -> str:
     return f"user:{user_id}" if user_id else f"ip:{client_ip or 'unknown'}"
 
 
+class FallbackNotice:
+    """Counts the rate-limit checks redix could not answer, and says so in the log without flooding it.
+    A redix that is down, or whose connection pool is full, fails every check, and each failure used to
+    be a warning of its own - 15,395 of the same line in a few minutes under load, burying everything
+    else. Now every failure is counted (arc_gateway_rate_limit_fallbacks_total), and one line per
+    distinct error per `interval` seconds is written, saying how many more it held back."""
+
+    #: distinct error texts remembered at once; a text that varies (an address, a timestamp) would
+    #: otherwise grow the table without bound
+    _MAX_KINDS = 64
+
+    def __init__(self, interval: float = 30.0, clock: Callable[[], float] = time.monotonic) -> None:
+        self.total = 0
+        self._interval = interval
+        self._clock = clock
+        self._last_logged: dict[str, float] = {}
+        self._held_back: dict[str, int] = {}
+
+    def record(self, exc: BaseException) -> None:
+        self.total += 1
+        kind = f"{type(exc).__name__}: {exc}"[:200]
+        now = self._clock()
+        last = self._last_logged.get(kind)
+        if last is not None and now - last < self._interval:
+            self._held_back[kind] = self._held_back.get(kind, 0) + 1
+            return
+        if len(self._last_logged) >= self._MAX_KINDS:
+            self._last_logged.clear()
+            self._held_back.clear()
+        self._last_logged[kind] = now
+        held_back = self._held_back.pop(kind, 0)
+        _logger.warning(
+            "redix rate_limit failed (%s) — using in-process fallback%s",
+            exc,
+            f" ({held_back} more in the last {self._interval:.0f}s not shown)" if held_back else "",
+        )
+
+
+#: this process's count of fallbacks; read by GatewayProvider.metrics()
+RATE_LIMIT_FALLBACKS = FallbackNotice()
+
+
 async def check_rate_limit(
     kernel: Any, fallback: LocalRateLimiter, key: str, limit: int, window_seconds: int
 ) -> bool:
@@ -789,7 +831,7 @@ async def check_rate_limit(
         try:
             return await redix.rate_limit(key, limit, window_seconds)
         except Exception as exc:
-            _logger.warning("redix rate_limit failed (%s) — using in-process fallback", exc)
+            RATE_LIMIT_FALLBACKS.record(exc)
     return await fallback.allow(key, limit, window_seconds)
 
 
