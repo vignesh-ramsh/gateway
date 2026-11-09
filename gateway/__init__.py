@@ -1421,7 +1421,8 @@ def register(kernel: Any) -> None:
     # list support, so there's nothing to hand those two off to.
     kernel.settings.declare(
         CORS_ORIGINS_KEY,
-        doc="Comma-separated allowed cross-origin hosts, or '*'. Empty/unset disables CORS.",
+        doc="Which other websites may call this server from a browser (CORS). A comma-separated list of site "
+        "addresses, or `*` for any site. If empty, other sites are not allowed.",
     )
     kernel.settings.declare(
         CSRF_ENABLED_KEY,
@@ -1433,68 +1434,73 @@ def register(kernel: Any) -> None:
         # bearer/API-key-only deployment, or a request with no session
         # yet such as /login, is untouched either way), so there is no
         # ordinary request shape this newly starts rejecting.
-        doc="Double-submit CSRF check on unsafe methods carrying a session cookie.",
+        doc="Protects against cross-site request forgery: a request that changes data (POST, PUT, DELETE and so "
+        "on) from a signed-in browser must carry a matching token. Turning it off makes the site easier to "
+        "attack.",
     )
     kernel.settings.declare(
         FORCE_HTTPS_KEY,
         type=bool,
         default=False,
-        doc="Send Strict-Transport-Security — only enable once served over TLS.",
+        doc="Tells browsers to use only https for this site (the Strict-Transport-Security header). Turn it on "
+        "only after the site works over https, because browsers remember it.",
     )
     kernel.settings.declare(
         CSP_KEY,
         default=DEFAULT_CSP,
-        doc="Content-Security-Policy value. Empty disables it entirely.",
+        doc="The Content-Security-Policy rule sent with pages: it tells the browser what a page may load. If "
+        "empty, the header is not sent at all. The default only allows content from this site itself.",
     )
     kernel.settings.declare(
         CSP_REPORT_ONLY_KEY,
         type=bool,
         default=True,
-        doc="Send CSP as Content-Security-Policy-Report-Only instead of "
-        "enforcing it. See DEFAULT_CSP's own comment for why this defaults on.",
+        doc="When on (the default), the Content-Security-Policy is only reported by the browser, not enforced, so "
+        "nothing is blocked while you check that the policy is safe. Turn it off to enforce the policy.",
     )
     kernel.settings.declare(
         TRUSTED_PROXIES_KEY,
-        doc="Comma-separated trusted reverse-proxy IPs, for X-Forwarded-For parsing.",
+        doc="The addresses of reverse proxies (such as nginx) in front of ARC that you trust, as a comma-separated "
+        "list. Only a request that comes from one of them may say who the real visitor is. When ARC runs "
+        "behind nginx on the same server, set it to `127.0.0.1`.",
     )
     kernel.settings.declare(
         FORWARDED_HEADER_KEY,
         default="X-Forwarded-For",
-        doc="Which header to trust for the client IP when trusted_proxies is set.",
+        doc="The name of the header in which a trusted reverse proxy such as nginx passes the visitor's real "
+        "address. Used only when `gateway_trusted_proxies` is set.",
     )
     kernel.settings.declare(
         MAX_BODY_BYTES_KEY,
         type=int,
         default=DEFAULT_MAX_BODY_BYTES,
-        doc="Global request body size ceiling, in bytes.",
+        doc="The biggest request body an ordinary route accepts, in bytes (default 10 MB). Bigger ones are refused "
+        "with a 413 answer. Upload routes have their own, larger limit.",
     )
     kernel.settings.declare(
         MAX_JSON_BODY_BYTES_KEY,
         type=int,
         default=DEFAULT_MAX_JSON_BODY_BYTES,
-        doc="Largest JSON request body, in bytes, that is decoded (413 above it), on every route: "
-        "a route's own max_body_bytes lets big uploads in, not big JSON. Decoding runs on the event loop and costs about 7 ms per MB, "
-        "pausing every other request on that worker meanwhile. 0 = no separate ceiling "
-        "(gateway_max_body_bytes applies). Restart to apply.",
+        doc="The biggest JSON body the server will read, in bytes (default 2 MiB; 0 means the general body limit "
+        "applies). A bigger one is refused with a 413 answer. Reading JSON pauses everything else on that "
+        "worker for a moment (about 7 ms per MB), so keep it small. File uploads are not affected. Restart to "
+        "apply.",
     )
     kernel.settings.declare(
         MAX_INFLIGHT_BODY_BYTES_KEY,
         type=int,
         default=DEFAULT_MAX_INFLIGHT_BODY_BYTES,
-        doc="Most bytes of request bodies (those over 64 KB) one web worker holds in memory at once, "
-        "default 256 MiB, 0 = no bound. A body is read whole before its handler runs, so a crowd of big "
-        "uploads is a crowd of big allocations (about 0.7 MB of memory per MB of body). A request that does "
-        "not fit waits up to 5 s for room, then gets 503 with Retry-After; one bigger than the whole bound "
-        "is let in alone. Restart to apply.",
+        doc="The most request-body data, in bytes, that one web worker holds in memory at the same moment (default "
+        "256 MiB; 0 means no limit). A body is read in full before it is handled, so many big uploads at once "
+        "use a lot of memory. A request that does not fit waits up to 5 seconds, then gets a 503 with a 'try "
+        "again' hint. Restart to apply.",
     )
     kernel.settings.declare(
         ACCESS_LOG_KEY,
         default=DEFAULT_ACCESS_LOG_MODE,
-        doc="Where each request's access line goes: 'file' (default; only "
-        "logs/gateway.jsonl), 'console' (also the terminal/journal via `arc "
-        "run`; at thousands of requests per second the relay becomes the "
-        "bottleneck), or 'off'. Request metrics are kept in every mode. "
-        "Restart to apply.",
+        doc="Where each request is logged: `file` (the default, only `logs/gateway.jsonl`), `console` (also the "
+        "terminal or system journal when run with `arc run`; at thousands of requests a second this slows the "
+        "server down), or `off`. The counts shown at /metrics are kept in every mode. Restart to apply.",
     )
     kernel.settings.declare(
         RATE_LIMIT_ENABLED_KEY,
@@ -1505,28 +1511,29 @@ def register(kernel: Any) -> None:
         # DEFAULT_RATE_LIMIT_REQUESTS's own comment for why 300/60s
         # clears ordinary usage without meaningfully weakening the
         # protection.
-        doc="Per-identity/IP request-volume limiting.",
+        doc="Limits how many requests one visitor can make in a time window (set by the next two settings). "
+        "Signed-in users are counted by user, everyone else by network address.",
     )
     kernel.settings.declare(
         RATE_LIMIT_REQUESTS_KEY,
         type=int,
         default=DEFAULT_RATE_LIMIT_REQUESTS,
-        doc="Requests allowed per window before a 429.",
+        doc="How many requests one visitor may make in one window (see `gateway_rate_limit_window_seconds`) before "
+        "getting a 429 'too many requests' answer.",
     )
     kernel.settings.declare(
         RATE_LIMIT_WINDOW_SECONDS_KEY,
         type=int,
         default=DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
-        doc="Rate-limit window length, in seconds.",
+        doc="The length, in seconds, of the window used by the request limit.",
     )
     kernel.settings.declare(
         RATE_LIMIT_EXEMPT_KEY,
-        doc="Networks (comma-separated IP addresses or CIDR ranges, e.g. '203.0.113.0/24,10.1.2.3') "
-        "whose ANONYMOUS traffic is not counted by the per-IP request limit - an office of "
-        "hundreds behind one public address otherwise shares one budget of "
-        "gateway_rate_limit_requests - and which authn does not hold to its failed-login budget. "
-        "Signed-in users keep their own per-user limit. The address is the one the gateway sees: "
-        "set gateway_trusted_proxies first when running behind nginx, or it is nginx's own.",
+        doc="Networks that are not counted by the request limit while their visitors are not signed in: a "
+        "comma-separated list of addresses or ranges such as `203.0.113.0/24,10.1.2.3`. Useful for an office "
+        "whose many users share one public address. These networks are also not held to the failed-login "
+        "limit. Signed-in users keep their own limit. Behind nginx, set `gateway_trusted_proxies` first, or "
+        "the address ARC sees is nginx's own.",
     )
     kernel.settings.declare(
         MAINTENANCE_MODE_KEY,
@@ -1536,38 +1543,32 @@ def register(kernel: Any) -> None:
         # like every setting above — see _dispatch's own comment. Toggle it
         # with `arc set-maintenance on|off`, not by hand-editing arc.toml
         # (works either way; the CLI command is just the documented path).
-        doc="While on, every request gets a 503 (maintenance page to a "
-        "browser, JSON to an API client) instead of routing normally. "
-        "Read fresh per request — takes effect immediately, no restart.",
+        doc="When on, every request gets a 503 'down for maintenance' answer (a maintenance page in a browser, "
+        "JSON for an API client). Takes effect right away, no restart needed.",
     )
     kernel.settings.declare(
         DEBUG_KEY,
         type=bool,
         default=False,
-        doc="Include exception type/message/traceback in EVERY caller's 500 "
-        "response, authenticated or not. Off by default — prefer "
-        "gateway_debug_roles instead; this exists for an authn-less "
-        "deployment with no identity/roles to gate on at all.",
+        doc="When on, the error page for an unexpected server error (HTTP 500) shows the technical detail (error "
+        "type, message and traceback) to everyone, signed in or not. Keep it off and use `gateway_debug_roles` "
+        "instead. It exists only for sites with no logins at all.",
     )
     kernel.settings.declare(
         DEBUG_ROLES_KEY,
         default=DEFAULT_DEBUG_ROLES,
-        doc="Comma-separated roles that get full exception detail on an "
-        "unhandled 500, instead of the generic message. Default '*' means "
-        "any authenticated caller (never an anonymous/no-identity one, "
-        "in any configuration) — narrow to specific role names (e.g. "
-        "'Superuser,Support') to restrict further. Known secret SETTINGS "
-        "are redacted from the detail either way, but it can still surface "
-        "internal structure (table/column/variable names) — grant with "
-        "that in mind. Read fresh per request, no restart needed.",
+        doc="Which roles see the technical detail when an unexpected server error (HTTP 500) happens, instead of a "
+        "plain message. A comma-separated list of role names such as `Superuser,Support`. The default `*` "
+        "means any signed-in user, never an anonymous visitor. Known secret settings are hidden from the "
+        "detail, but it can still show internal names, so grant it carefully. Takes effect right away, no "
+        "restart needed.",
     )
     kernel.settings.declare(
         METRICS_TOKEN_KEY,
         default="",
-        doc="Bearer token required on GET /metrics. Empty/unset (default) "
-        "leaves /metrics open — protect it via network boundary/reverse "
-        "proxy instead, or set this for an Authorization: Bearer <token> "
-        "gate. Read fresh per request, no restart needed.",
+        doc="A password (bearer token) that must be sent to read `/metrics`, the page of server statistics. If "
+        "empty, /metrics is open, so protect it with your network or reverse proxy instead. Takes effect right "
+        "away.",
     )
 
     raw_origins = kernel.settings.get(CORS_ORIGINS_KEY)
