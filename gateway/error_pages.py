@@ -23,8 +23,10 @@ gateway's error handling has to know this module exists.
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Any
 
+from .csp import inline_page_csp
 from .request import get_header, send_bytes, send_json
 
 _PAGES: dict[int, tuple[str, str, str]] = {
@@ -98,6 +100,11 @@ def _render(status_code: int) -> bytes:
 """.encode("utf-8")
 
 
+@cache
+def _page_csp(status_code: int) -> str:
+    return inline_page_csp(_render(status_code).decode("utf-8"))
+
+
 async def send_error(
     send,
     scope: dict,
@@ -113,7 +120,8 @@ async def send_error(
     if status_code in _PAGES and _wants_html(scope):
         await send_bytes(
             send, status_code, _render(status_code), content_type="text/html; charset=utf-8",
-            extra_headers=extra_headers,
+            # the page's one inline <style> is allowed by hash; the site-wide policy would block it
+            extra_headers={**(extra_headers or {}), "Content-Security-Policy": _page_csp(status_code)},
         )
         return
     await send_json(send, status_code, json_body, extra_headers=extra_headers)

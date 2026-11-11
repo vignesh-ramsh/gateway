@@ -23,9 +23,14 @@ hiding this from a handler):
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import arc
+
+_logger = logging.getLogger("gateway.websocket")
 
 # 1008 Policy Violation — the one standard WS close code that actually
 # means "the server rejected this on authorization grounds", used when a
@@ -49,6 +54,27 @@ RATE_LIMITED = 4029
 # unexpected close is the right response here too (the server is
 # temporarily down, not permanently refusing this client).
 MAINTENANCE = 4503
+
+# 1013 Try Again Later - the standard code for "the server cannot keep up
+# with you right now". Sent to a client that stopped reading so far behind
+# that its outbound queue filled up; a well-behaved client reconnects.
+TRY_AGAIN_LATER = 1013
+
+# Broadcast messages waiting to be written to ONE connection. A client that
+# reads slower than messages are produced fills this and is closed
+# (TRY_AGAIN_LATER) instead of making delivery to everyone else wait on it.
+OUTBOX_MAX_MESSAGES = 100
+
+# How long a connection's identity is trusted before it is looked up again
+# (a message arriving, or one about to be delivered, triggers the check). A
+# session revoked, a user disabled, or a role taken away closes the socket
+# within this long of the next message instead of staying valid until the
+# client leaves. The session lookup is cached, so the check is cheap.
+IDENTITY_RECHECK_SECONDS = 60.0
+# After an identity lookup FAILS (database or cache down), ask again after
+# this long instead of dropping every open socket over a blip, and without
+# retrying on every single message.
+_IDENTITY_RETRY_SECONDS = 10.0
 
 
 class WebSocketDisconnect(Exception):
@@ -81,6 +107,9 @@ class WebSocketConnection:
         subscribe: Callable[["WebSocketConnection", str], Awaitable[None]],
         unsubscribe: Callable[["WebSocketConnection", str], Awaitable[None]],
         rate_limited: Callable[[], Awaitable[bool]] | None = None,
+        revalidate: Callable[[], Awaitable[bool]] | None = None,
+        recheck_seconds: float | None = None,
+        outbox_max: int = OUTBOX_MAX_MESSAGES,
     ) -> None:
         self.scope = scope
         self.identity = identity
@@ -99,6 +128,20 @@ class WebSocketConnection:
         # None when rate_limit_enabled is off — every check becomes a
         # no-op rather than a None-callable crash.
         self._rate_limited = rate_limited
+        # Looks the identity up again and says whether this connection may
+        # still stay open (see _identity_still_valid). None for an anonymous
+        # connection: there is no session to lose.
+        self._revalidate = revalidate
+        # read at construction, not baked into the signature, so it can be tuned (tests)
+        self._recheck_seconds = IDENTITY_RECHECK_SECONDS if recheck_seconds is None else recheck_seconds
+        self._identity_checked_at = time.monotonic()
+        self._identity_lock: asyncio.Lock | None = None
+        # Broadcast messages are queued here and written by one task per
+        # connection (see push_nowait), so delivery to a channel never waits
+        # on a slow client.
+        self._outbox_max = outbox_max
+        self._outbox: asyncio.Queue[str] | None = None
+        self._writer: asyncio.Task | None = None
         self._channels: set[str] = set()
         self.accepted = False
         self.closed = False
@@ -134,6 +177,13 @@ class WebSocketConnection:
         if self.closed:
             return
         self.closed = True
+        # No more queued broadcasts after this point - the close frame must
+        # be the last thing written. (Not cancelled when close() is being
+        # called BY the writer itself, e.g. after a failed identity check:
+        # it returns right after.)
+        writer = self._writer
+        if writer is not None and writer is not asyncio.current_task():
+            writer.cancel()
         for channel in list(self._channels):
             await self._unsubscribe_hub(self, channel)
         if self._wire_dead:
@@ -191,7 +241,43 @@ class WebSocketConnection:
         if self._rate_limited is not None and not await self._rate_limited():
             await self.close(RATE_LIMITED)
             raise WebSocketDisconnect(RATE_LIMITED)
+        if not await self._identity_still_valid():
+            await self.close(POLICY_VIOLATION)
+            raise WebSocketDisconnect(POLICY_VIOLATION)
         return message
+
+    async def _identity_still_valid(self) -> bool:
+        """False once the identity this connection was accepted under no
+        longer resolves (its session was revoked or expired, the user was
+        disabled, a required role was removed). Looked up again at most every
+        `recheck_seconds`; in between, and for connections with nothing to
+        re-check, always True. A lookup that fails with an error keeps the
+        connection and tries again shortly - a database blip must not drop
+        every open socket."""
+        if self._revalidate is None:
+            return True
+        if time.monotonic() - self._identity_checked_at < self._recheck_seconds:
+            return True
+        if self._identity_lock is None:
+            self._identity_lock = asyncio.Lock()
+        async with self._identity_lock:
+            # another task (the reader and the writer both check) may have
+            # just done it while this one waited
+            if time.monotonic() - self._identity_checked_at < self._recheck_seconds:
+                return True
+            try:
+                still_valid = await self._revalidate()
+            except Exception:
+                _logger.warning(
+                    "could not re-check a WebSocket's identity - keeping it open and retrying",
+                    exc_info=True,
+                )
+                self._identity_checked_at = (
+                    time.monotonic() - self._recheck_seconds + _IDENTITY_RETRY_SECONDS
+                )
+                return True
+            self._identity_checked_at = time.monotonic()
+            return still_valid
 
     async def receive_text(self) -> str:
         message = await self.receive_raw()
@@ -227,6 +313,46 @@ class WebSocketConnection:
     # ------------------------------------------------------------------ #
     # Sending
     # ------------------------------------------------------------------ #
+    def push_nowait(self, text: str) -> bool:
+        """Queue `text` for this connection and return at once. Used for
+        channel broadcasts: the hub calls this for every subscriber, so it
+        must never wait on one of them. A writer task per connection sends
+        the queued messages in order.
+
+        False when the message could not be queued - the connection is closed
+        or gone, or its queue is full because the client is not reading. The
+        caller drops such a connection (see GatewayProvider._deliver_local)."""
+        if self.closed or self._wire_dead:
+            return False
+        if self._outbox is None:
+            self._outbox = asyncio.Queue(maxsize=self._outbox_max)
+            self._writer = asyncio.create_task(self._write_queued())
+        try:
+            self._outbox.put_nowait(text)
+        except asyncio.QueueFull:
+            return False
+        return True
+
+    async def _write_queued(self) -> None:
+        outbox = self._outbox
+        try:
+            while True:
+                text = await outbox.get()
+                # A push-only subscriber never sends anything, so the reader
+                # side never re-checks it: check before delivering instead,
+                # so a revoked session stops receiving.
+                if not await self._identity_still_valid():
+                    await self.close(POLICY_VIOLATION)
+                    return
+                await self.send_text(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # the wire is gone (or the send failed some other way): stop
+            # writing; the connection's own handler ends through its reader
+            self._wire_dead = True
+            _logger.debug("a WebSocket's queued write failed", exc_info=True)
+
     async def send_text(self, text: str) -> None:
         await self._send({"type": "websocket.send", "text": text})
 

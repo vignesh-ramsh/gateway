@@ -300,7 +300,7 @@ def tracing_middleware(*, router: Any = None) -> Middleware:
 
 
 def security_headers_middleware(
-    *, hsts: bool = False, csp: str | None = None, csp_report_only: bool = True
+    *, hsts: bool = False, csp: str | None = None, csp_report_only: bool = False
 ) -> Middleware:
     """Baseline headers on every response. HSTS only if the app is confident
     it's served over TLS (`gateway_force_https` setting) — sending it over
@@ -321,20 +321,18 @@ def security_headers_middleware(
     principle: a baseline middleware should never assume it's the only
     thing with an opinion on a given header.
 
-    `csp` (`gateway_csp` setting) is sent Report-Only by default
-    (`csp_report_only`, `gateway_csp_report_only`, defaults True) — a real
-    policy strict enough to matter (no blanket 'unsafe-inline') would
-    currently break wschat's own demo chat page, which still embeds an
-    inline `<script>` (see api/chat.py's `_CHAT_HTML`; already documented
-    as demo-only/not-production-safe, but still a real page that would
-    stop working). authn's own `/impersonate` page used to be the same
-    story — fixed by moving its script to a static, same-origin
-    impersonate.js (auth_api.py) instead of embedding one inline, which is
-    the template to follow for wschat's page too, if it's ever meant to
-    survive an enforcing CSP. Report-Only observes real violations in
-    production without breaking what's left, and gives an operator that's
-    confirmed a policy is safe (or fixed the remaining inline-script case)
-    a single setting to flip to enforcing."""
+    `csp` (`gateway_csp` setting) is ENFORCED by default (`csp_report_only`,
+    `gateway_csp_report_only`, defaults False). It used to be sent
+    Report-Only because a policy this strict (no blanket 'unsafe-inline')
+    would have broken wschat's demo chat page and gateway's own error pages,
+    both of which carry inline code. Each of those now sends a
+    Content-Security-Policy of its own that allows exactly its own inline
+    <script>/<style> by hash - and, because this middleware only adds a
+    header the response does not already have, the global policy stays
+    strict for everything else. authn's `/impersonate` page needed no
+    exception: its script is the static, same-origin impersonate.js.
+    Report-Only remains available as a switch for trying out a new policy
+    without breaking pages."""
 
     def middleware(app: ASGIApp) -> ASGIApp:
         async def wrapped(scope, receive, send):

@@ -26,7 +26,9 @@ pgdb/redix were built. Gateway never knows these are "pgdb"/"redix".
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
+import inspect
 import logging
 import mimetypes
 import traceback
@@ -84,7 +86,13 @@ from .request import (
     send_stream,
 )
 from .router import WEBSOCKET_METHOD, Router, RouterError
-from .websocket import MAINTENANCE, POLICY_VIOLATION, RATE_LIMITED, WebSocketConnection
+from .websocket import (
+    MAINTENANCE,
+    POLICY_VIOLATION,
+    RATE_LIMITED,
+    TRY_AGAIN_LATER,
+    WebSocketConnection,
+)
 
 CAPABILITY = "gateway"
 
@@ -97,14 +105,16 @@ CSP_REPORT_ONLY_KEY = "gateway_csp_report_only"
 # reflected XSS via filer-served, user-uploaded bytes on the same origin as
 # the admin SPA (the audit finding this closes). frame-ancestors 'self'
 # matches x-frame-options' own SAMEORIGIN default rather than tightening
-# past it. Sent Report-Only by default (CSP_REPORT_ONLY_KEY) since a script-src
-# this strict would currently block wschat's demo chat page, which
-# still embeds an inline <script> — see security_headers_middleware's
-# own docstring for the full reasoning, and why authn's /impersonate
-# page no longer needs this exception.
+# past it. ENFORCED by default (CSP_REPORT_ONLY_KEY is off): the two pages
+# that carry inline code - wschat's demo page and gateway's own error pages -
+# send a CSP of their own that allows exactly their inline <script>/<style>
+# by hash, so nothing needs the global policy loosened for it. data: is
+# allowed for fonts and images only: the console's stylesheet inlines its small
+# web fonts as data: URIs, and data: in those two places cannot run code.
 DEFAULT_CSP = (
     "default-src 'self'; object-src 'none'; base-uri 'self'; "
-    "frame-ancestors 'self'; form-action 'self'"
+    "frame-ancestors 'self'; form-action 'self'; "
+    "img-src 'self' data:; font-src 'self' data:"
 )
 TRUSTED_PROXIES_KEY = "gateway_trusted_proxies"
 FORWARDED_HEADER_KEY = "gateway_forwarded_header"
@@ -144,20 +154,23 @@ METRICS_TOKEN_KEY = "gateway_metrics_token"
 # open, same posture as /openapi.json — protect it via network boundary/
 # reverse proxy, or set this for an Authorization: Bearer <token> gate.
 
+OPENAPI_PUBLIC_KEY = "gateway_openapi_public"
+# /openapi and /openapi.json list every route, including the admin console's. Closed to anonymous
+# callers by default (401 until a user is signed in); this opens them to anyone.
+
 DEBUG_KEY = "gateway_debug"
 DEBUG_ROLES_KEY = "gateway_debug_roles"
-# "*" reuses the SAME sentinel relay's own RBAC check already gives this
-# exact meaning to (WhitelistedFunction roles=["*"] -> "any authenticated
-# identity", _wire_gateway_route's own `if "*" in wf.roles`) — every
-# authenticated caller (not the ambient, always-available "Guest" — see
-# that same check's own `caller_roles | {"Guest"}`) gets full exception
-# detail on an unhandled 500 by default; an anonymous/no-identity caller
-# never does, in any configuration. Narrow it to specific role names
-# (comma-separated, e.g. "Superuser,Support") to restrict further — a
-# caller whose own roles already include "*" (authn's Superuser
-# convention) always qualifies regardless, same as it would for any
-# other role-gated route.
-DEFAULT_DEBUG_ROLES = "*"
+# Only Superusers see the exception, message and traceback of an unhandled
+# 500 by default. It used to be "*", which is relay's sentinel for "any
+# authenticated identity" (WhitelistedFunction roles=["*"]): every
+# signed-in user, however unprivileged, could make a request fail and read
+# internal module names, file layout and query text off the traceback. An
+# anonymous/no-identity caller never gets it, in any configuration. Widen it
+# to role names (comma-separated, e.g. "Superuser,Support") or back to "*"
+# - a caller whose own roles already include "*" (authn's Superuser
+# convention) always qualifies regardless, same as for any role-gated route.
+# Setting it to "*" is reported at boot (see register()).
+DEFAULT_DEBUG_ROLES = "Superuser"
 
 MAINTENANCE_MODE_KEY = "gateway_maintenance_mode"
 # 300 req/60s (5/sec sustained) — generous enough that normal admin-console
@@ -172,6 +185,17 @@ DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 
 _logger = logging.getLogger("gateway")
+
+# Redis pub/sub listener behind a WS channel: when it dies (Redis restarted,
+# connection dropped) it is started again after this long, doubling up to the
+# maximum while it keeps failing. It is started over with the short delay once
+# a listener has stayed up for the "healthy" time.
+_WS_PUMP_RETRY_START_SECONDS = 1.0
+_WS_PUMP_RETRY_MAX_SECONDS = 30.0
+_WS_PUMP_HEALTHY_SECONDS = 30.0
+# Closing a slow client sends a close frame the client may never read; give
+# up on that frame after this long rather than hold the task forever.
+_WS_SLOW_CLOSE_TIMEOUT_SECONDS = 5.0
 
 #: Below this length a "secret" is almost certainly a placeholder/empty
 #: value, not a real one — redacting it would risk blind-replacing short,
@@ -261,7 +285,7 @@ class GatewayProvider:
         csrf_enabled: bool = False,
         hsts: bool = False,
         csp: str | None = None,
-        csp_report_only: bool = True,
+        csp_report_only: bool = False,
         trusted_proxies: list[str] | None = None,
         forwarded_header: str = "X-Forwarded-For",
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
@@ -313,6 +337,13 @@ class GatewayProvider:
         # first subscribe() and cancelled once the last one leaves.
         self._ws_channels: dict[str, set[WebSocketConnection]] = {}
         self._ws_redix_tasks: dict[str, asyncio.Task] = {}
+        # Connections being closed because they stopped reading (their
+        # outbound queue filled), and the tasks doing the closing. Counters
+        # for /metrics: pub/sub listeners restarted, slow clients dropped.
+        self._ws_dropping: set[WebSocketConnection] = set()
+        self._ws_close_tasks: set[asyncio.Task] = set()
+        self._ws_pump_restarts_total = 0
+        self._ws_slow_clients_closed_total = 0
 
         # Fixed order: request_id -> security headers -> CORS -> CSRF ->
         # client_ip -> identity -> access_log -> rate_limit. request_id is
@@ -576,19 +607,45 @@ class GatewayProvider:
         await self._deliver_local(channel, encoded)
 
     async def _deliver_local(self, channel: str, encoded_text: str) -> None:
+        """Hand `encoded_text` to every local subscriber of `channel`. Never
+        waits on a subscriber: each connection has its own bounded queue and
+        writer task (WebSocketConnection.push_nowait), so one client that
+        stopped reading cannot hold up delivery to the rest of the channel.
+        A connection whose queue is full (or whose wire is gone) is dropped
+        from the hub and closed with "try again later"."""
         for connection in list(self._ws_channels.get(channel, ())):
-            try:
-                await connection.send_text(encoded_text)
-            except Exception:
-                # A dead/dropped connection shouldn't stop delivery to
-                # every OTHER subscriber on this channel — its own
-                # disconnect handling (_dispatch_websocket's finally
-                # block) is what actually removes it from this set; this
-                # is just one failed send along the way, not fatal to the
-                # broadcast as a whole.
-                _logger.debug(
-                    "failed to deliver a WS broadcast on channel %r", channel, exc_info=True
-                )
+            if connection in self._ws_dropping:
+                continue
+            if not connection.push_nowait(encoded_text):
+                self._drop_ws_connection(connection, channel)
+        # Let the writer tasks run. Without a suspension here a burst of
+        # messages (a producer in a loop, or a backlog the Redis listener
+        # reads without waiting) would be queued faster than ANY client's
+        # writer could start, and a client that is keeping up would overflow
+        # its queue just like one that is not.
+        await asyncio.sleep(0)
+
+    def _drop_ws_connection(self, connection: WebSocketConnection, channel: str) -> None:
+        self._ws_dropping.add(connection)
+        self._ws_slow_clients_closed_total += 1
+        _logger.warning(
+            "closing a WebSocket on channel %r: it is not keeping up with the messages "
+            "sent to it (outbound queue full) or its connection is gone",
+            channel,
+        )
+        task = asyncio.create_task(self._close_ws_connection(connection))
+        self._ws_close_tasks.add(task)
+        task.add_done_callback(self._ws_close_tasks.discard)
+
+    async def _close_ws_connection(self, connection: WebSocketConnection) -> None:
+        try:
+            await asyncio.wait_for(
+                connection.close(TRY_AGAIN_LATER), timeout=_WS_SLOW_CLOSE_TIMEOUT_SECONDS
+            )
+        except Exception:  # noqa: BLE001 - includes a close frame that timed out; nothing more to do
+            _logger.debug("closing a slow WebSocket did not finish cleanly", exc_info=True)
+        finally:
+            self._ws_dropping.discard(connection)
 
     async def _pump_redix_channel(self, channel: str, redix: Any) -> None:
         """Runs for as long as `channel` has at least one local subscriber
@@ -597,19 +654,61 @@ class GatewayProvider:
         local subscriber leaves. Every message this worker's own
         broadcast() publishes to `channel` comes back through here too
         (see broadcast()'s own docstring), so _deliver_local is the ONE
-        place a message actually reaches a connection's send_text."""
-        try:
-            pubsub = await redix.subscribe(channel)
-            async for msg in pubsub.listen():
-                if msg.get("type") != "message":
-                    continue
-                data = msg["data"]
-                text = data.decode("utf-8") if isinstance(data, bytes) else data
-                await self._deliver_local(channel, text)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _logger.exception("redix pub/sub listener for WS channel %r died", channel)
+        place a message actually reaches a connection's send_text.
+
+        When the listener ends - an error, or Redis closing the connection
+        (a restart) - it subscribes again after a growing delay instead of
+        stopping for good: subscribers stay connected, and a listener that
+        quietly ended used to leave them receiving nothing until they
+        reconnected. Redis pub/sub keeps no history, so messages published
+        while the listener was down are not delivered afterwards."""
+        delay = _WS_PUMP_RETRY_START_SECONDS
+        loop = asyncio.get_running_loop()
+        while True:
+            pubsub = None
+            started = loop.time()
+            try:
+                pubsub = await redix.subscribe(channel)
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    data = msg["data"]
+                    text = data.decode("utf-8") if isinstance(data, bytes) else data
+                    await self._deliver_local(channel, text)
+                _logger.warning(
+                    "redix pub/sub listener for WS channel %r ended; subscribing again in %.0fs",
+                    channel,
+                    delay,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception(
+                    "redix pub/sub listener for WS channel %r died; subscribing again in %.0fs",
+                    channel,
+                    delay,
+                )
+            finally:
+                await self._close_pubsub(pubsub)
+            if loop.time() - started >= _WS_PUMP_HEALTHY_SECONDS:
+                delay = _WS_PUMP_RETRY_START_SECONDS
+            self._ws_pump_restarts_total += 1
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _WS_PUMP_RETRY_MAX_SECONDS)
+
+    @staticmethod
+    async def _close_pubsub(pubsub: Any) -> None:
+        """Best effort: release a dead listener's connection before a new one
+        is made. redis-py spells this aclose() (newer) or close()."""
+        if pubsub is None:
+            return
+        closer = getattr(pubsub, "aclose", None) or getattr(pubsub, "close", None)
+        if closer is None:
+            return
+        with contextlib.suppress(Exception):
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
 
     async def _ws_subscribe(self, connection: WebSocketConnection, channel: str) -> None:
         connections = self._ws_channels.setdefault(channel, set())
@@ -743,6 +842,9 @@ class GatewayProvider:
             "inflight_body_bytes": self._body_budget.in_flight,
             "inflight_body_waiting": self._body_budget.waiting,
             "inflight_body_rejected_total": self._body_budget.rejected_total,
+            # WebSocket hub: pub/sub listeners restarted after dying, and clients closed for not reading
+            "ws_pubsub_restarts_total": self._ws_pump_restarts_total,
+            "ws_slow_clients_closed_total": self._ws_slow_clients_closed_total,
         }
 
     # ------------------------------------------------------------------ #
@@ -1148,6 +1250,19 @@ class GatewayProvider:
                 await reject(POLICY_VIOLATION)
                 return
 
+        # The client address comes FIRST and goes into scope["state"] where
+        # the HTTP client_ip middleware puts it: authn enforces a user's
+        # allowed_ips by reading scope["state"]["arc_client_ip"] while it
+        # resolves the identity, so without it every user with an IP
+        # allow-list resolved to "nobody" here and could never connect to a
+        # signed-in-only socket.
+        client_ip = resolve_client_ip(
+            scope,
+            trusted_proxies=set(self._trusted_proxies),
+            forwarded_header=self._forwarded_header.encode("latin-1").lower(),
+        )
+        scope = {**scope, "state": {**scope.get("state", {}), "arc_client_ip": client_ip}}
+
         authn_provider = self._kernel.get("authn") if self._kernel.has("authn") else None
         resolve = getattr(authn_provider, "resolve_identity", None)
         try:
@@ -1163,11 +1278,6 @@ class GatewayProvider:
             arc.errors.capture(identity_exc, source="gateway", stage="identity", method="WEBSOCKET")
             identity = None
 
-        client_ip = resolve_client_ip(
-            scope,
-            trusted_proxies=set(self._trusted_proxies),
-            forwarded_header=self._forwarded_header.encode("latin-1").lower(),
-        )
         rl_key = rate_limit_key(identity, client_ip)
 
         # Rate-limited before the roles check, not after — a flood of
@@ -1193,16 +1303,33 @@ class GatewayProvider:
         # _wire_gateway_route uses (relay/__init__.py) — not a
         # WS-specific reinterpretation of "*"/"Guest", the identical
         # meaning on both transports.
-        caller_roles = set(getattr(identity, "roles", None) or [])
-        if "*" in route.roles:
-            authorized = identity is not None
-        elif "*" in caller_roles:
-            authorized = True
-        else:
-            authorized = bool((caller_roles | {"Guest"}) & route.roles)
-        if not authorized:
+        def authorized_for_route(who: Any) -> bool:
+            caller_roles = set(getattr(who, "roles", None) or [])
+            if "*" in route.roles:
+                return who is not None
+            if "*" in caller_roles:
+                return True
+            return bool((caller_roles | {"Guest"}) & route.roles)
+
+        if not authorized_for_route(identity):
             await reject(POLICY_VIOLATION)
             return
+
+        revalidate = None
+        if identity is not None and callable(resolve):
+            # Re-checked later, while the socket is open (see
+            # WebSocketConnection._identity_still_valid): the identity may
+            # stop resolving (session revoked or expired, user disabled, IP
+            # no longer allowed) or lose the role this route needs. The same
+            # scope is used, so the client address is part of the lookup.
+            async def revalidate() -> bool:
+                fresh = await resolve(scope)
+                if fresh is None or getattr(fresh, "user_id", None) != getattr(identity, "user_id", None):
+                    return False
+                if not authorized_for_route(fresh):
+                    return False
+                connection.identity = fresh
+                return True
 
         async def check_message_rate() -> bool:
             # A DIFFERENT counter from the connection-attempt check above
@@ -1231,6 +1358,7 @@ class GatewayProvider:
             subscribe=self._ws_subscribe,
             unsubscribe=self._ws_unsubscribe,
             rate_limited=check_message_rate if self._rate_limit_enabled else None,
+            revalidate=revalidate,
         )
         try:
             await route.handler(connection)
@@ -1353,20 +1481,31 @@ class GatewayProvider:
 
     # ------------------------------------------------------------------ #
     def _register_builtin_routes(self) -> None:
+        def _require_signed_in(request: Request) -> None:
+            """The route table is a map of the whole API, admin console included - not for anonymous
+            callers unless the operator opened it (gateway_openapi_public)."""
+            if request.identity is None and not self._kernel.settings.get(OPENAPI_PUBLIC_KEY):
+                raise HTTPError(
+                    401,
+                    {"error": "authentication required", "detail": "sign in to read the API documentation"},
+                )
+
         async def _openapi_handler(request: Request) -> EncodedJSON:
+            _require_signed_in(request)
             # Encoded once with the document; etag=True below lets a client that has it get a 304.
             return self._document("openapi.json", lambda: EncodedJSON(encode_json(self.openapi_spec())))
 
         self._router.add_route(
-            "GET", "/openapi.json", _openapi_handler, summary="OpenAPI 3.0 document", etag=True
+            "GET", "/openapi.json", _openapi_handler, summary="OpenAPI 3.0 document (signed-in users)", etag=True
         )
 
         async def _openapi_ui_handler(request: Request) -> Response:
+            _require_signed_in(request)
             text = self._document("openapi.html", lambda: render_openapi_html(self._router.all_routes()))
             return Response(content=text, media_type="text/html; charset=utf-8")
 
         self._router.add_route(
-            "GET", "/openapi", _openapi_ui_handler, summary="Browsable API routes, grouped by plugin"
+            "GET", "/openapi", _openapi_ui_handler, summary="Browsable API routes, grouped by plugin (signed-in users)"
         )
 
         async def _openapi_css_handler(request: Request) -> Response:
@@ -1454,9 +1593,17 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(
         CSP_REPORT_ONLY_KEY,
         type=bool,
-        default=True,
-        doc="When on (the default), the Content-Security-Policy is only reported by the browser, not enforced, so "
-        "nothing is blocked while you check that the policy is safe. Turn it off to enforce the policy.",
+        default=False,
+        doc="When on, the Content-Security-Policy is only reported by the browser, not enforced, so nothing is "
+        "blocked while you check a policy you changed. Off (the default) means the policy is enforced.",
+    )
+    kernel.settings.declare(
+        OPENAPI_PUBLIC_KEY,
+        type=bool,
+        default=False,
+        doc="Who may read the API documentation at `/openapi` and `/openapi.json`, which lists every route "
+        "including the admin console's. Off (the default): only signed-in users. On: anyone. Takes effect right "
+        "away.",
     )
     kernel.settings.declare(
         TRUSTED_PROXIES_KEY,
@@ -1552,16 +1699,16 @@ def register(kernel: Any) -> None:
         default=False,
         doc="When on, the error page for an unexpected server error (HTTP 500) shows the technical detail (error "
         "type, message and traceback) to everyone, signed in or not. Keep it off and use `gateway_debug_roles` "
-        "instead. It exists only for sites with no logins at all.",
+        "instead. It exists only for sites with no logins at all, and is reported at startup when on.",
     )
     kernel.settings.declare(
         DEBUG_ROLES_KEY,
         default=DEFAULT_DEBUG_ROLES,
         doc="Which roles see the technical detail when an unexpected server error (HTTP 500) happens, instead of a "
-        "plain message. A comma-separated list of role names such as `Superuser,Support`. The default `*` "
-        "means any signed-in user, never an anonymous visitor. Known secret settings are hidden from the "
-        "detail, but it can still show internal names, so grant it carefully. Takes effect right away, no "
-        "restart needed.",
+        "plain message. A comma-separated list of role names such as `Superuser,Support`. The default is "
+        "`Superuser`. `*` means any signed-in user (never an anonymous visitor) and is reported at startup, "
+        "because the detail shows internal names, file paths and queries. Known secret settings are hidden from "
+        "the detail. Takes effect right away, no restart needed.",
     )
     kernel.settings.declare(
         METRICS_TOKEN_KEY,
@@ -1588,6 +1735,21 @@ def register(kernel: Any) -> None:
             f"checked against it is the immediate peer's - behind nginx that is nginx itself, and the "
             f"exemption would match nobody (or, if 127.0.0.1 is listed, everybody). Set "
             f"gateway_trusted_proxies to the proxy's address."
+        )
+    if kernel.settings.get(DEBUG_KEY):
+        kernel.advise(
+            f"gateway: {DEBUG_KEY} is on - every visitor, signed in or not, sees the traceback of a failed "
+            f"request. Turn it off and use {DEBUG_ROLES_KEY}."
+        )
+    elif (kernel.settings.get(DEBUG_ROLES_KEY) or "").strip() == "*":
+        kernel.advise(
+            f"gateway: {DEBUG_ROLES_KEY} is '*' - every signed-in user sees the traceback of a failed request "
+            f"(module names, file paths, query text). The safe value is 'Superuser'."
+        )
+    if kernel.settings.get(CSP_KEY) and kernel.settings.get(CSP_REPORT_ONLY_KEY):
+        kernel.advise(
+            f"gateway: {CSP_REPORT_ONLY_KEY} is on - the Content-Security-Policy is reported, not enforced, so "
+            f"it protects nothing. Turn it off once a browser console shows no violations."
         )
     max_json_body_bytes = kernel.settings.get(MAX_JSON_BODY_BYTES_KEY)
     if max_json_body_bytes < 0:
