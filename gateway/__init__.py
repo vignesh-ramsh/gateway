@@ -49,6 +49,7 @@ from .middleware import (
     access_log_middleware,
     apply_access_log_mode,
     check_rate_limit,
+    ip_flood_middleware,
     in_networks,
     parse_networks,
     rate_limit_exempt,
@@ -144,6 +145,7 @@ RATE_LIMIT_ENABLED_KEY = "gateway_rate_limit_enabled"
 RATE_LIMIT_REQUESTS_KEY = "gateway_rate_limit_requests"
 RATE_LIMIT_WINDOW_SECONDS_KEY = "gateway_rate_limit_window_seconds"
 RATE_LIMIT_EXEMPT_KEY = "gateway_rate_limit_exempt"
+RATE_LIMIT_FLOOD_REQUESTS_KEY = "gateway_rate_limit_flood_requests"
 
 METRICS_TOKEN_KEY = "gateway_metrics_token"
 # Deliberately a PLAIN setting, not secret=True: a scrape credential read
@@ -181,6 +183,8 @@ MAINTENANCE_MODE_KEY = "gateway_maintenance_mode"
 # instead of shape.
 DEFAULT_RATE_LIMIT_REQUESTS = 300
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
+#: the per-address flood ceiling, when not set, is this many times the per-visitor limit
+RATE_LIMIT_FLOOD_FACTOR = 10
 
 ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
 
@@ -295,6 +299,7 @@ class GatewayProvider:
         rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
         rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
         rate_limit_exempt: list | None = None,
+        rate_limit_flood_requests: int = 0,
         access_log: str = DEFAULT_ACCESS_LOG_MODE,
     ) -> None:
         self._kernel = kernel
@@ -321,6 +326,10 @@ class GatewayProvider:
         self._metrics = RequestMetrics()
         self._readiness = ReadinessProbe(kernel)
         self._rate_limit_fallback = LocalRateLimiter()
+        # The coarse per-address ceiling that runs before identity (ip_flood_middleware): 0 = a multiple of
+        # the per-visitor limit. In-process on purpose: no Redis round trip per request.
+        self._ip_flood_limiter = LocalRateLimiter()
+        self._ip_flood_requests = rate_limit_flood_requests or rate_limit_requests * RATE_LIMIT_FLOOD_FACTOR
         # Stored (not just handed to rate_limit_middleware's own closure
         # below) because _dispatch_websocket needs these too — a
         # WebSocket connection is routed around the HTTP middleware chain
@@ -346,7 +355,10 @@ class GatewayProvider:
         self._ws_slow_clients_closed_total = 0
 
         # Fixed order: request_id -> security headers -> CORS -> CSRF ->
-        # client_ip -> identity -> access_log -> rate_limit. request_id is
+        # client_ip -> ip_flood -> identity -> access_log -> rate_limit. ip_flood
+        # is a coarse per-address ceiling that has to run BEFORE identity, so a
+        # flood of requests with made-up cookies is turned away before it costs
+        # a session lookup. request_id is
         # OUTERMOST so every other middleware — and any early rejection
         # that never reaches a handler at all (a CSRF 403, a 413, a 429) —
         # still carries the same correlation id. Both client_ip and
@@ -379,6 +391,13 @@ class GatewayProvider:
         # after it, exactly what rate_limit_middleware below now does.
         self._client_ip_mw_index = len(self._builtin_middlewares) - 1
         self._builtin_middlewares += [
+            ip_flood_middleware(
+                enabled=rate_limit_enabled,
+                limit=self._ip_flood_requests,
+                window_seconds=rate_limit_window_seconds,
+                limiter=self._ip_flood_limiter,
+                exempt_networks=self._rate_limit_exempt,
+            ),
             identity_middleware(kernel),
             access_log_middleware(self._metrics, mode=access_log),
             rate_limit_middleware(
@@ -838,6 +857,8 @@ class GatewayProvider:
             # rate-limit checks redix could not answer, decided from this process's own counter instead
             # (redix down, or its connection pool full) - looked up on the module so it is always the live one
             "rate_limit_fallbacks_total": _middleware.RATE_LIMIT_FALLBACKS.total,
+            # requests turned away by the per-address ceiling that runs before sign-in lookup
+            "ip_flood_rejected_total": _middleware.IP_FLOOD_REJECTIONS.total,
             # request bodies (over 64 KB) in memory now, waiting for room, and refused for lack of it
             "inflight_body_bytes": self._body_budget.in_flight,
             "inflight_body_waiting": self._body_budget.waiting,
@@ -1675,6 +1696,17 @@ def register(kernel: Any) -> None:
         doc="The length, in seconds, of the window used by the request limit.",
     )
     kernel.settings.declare(
+        RATE_LIMIT_FLOOD_REQUESTS_KEY,
+        type=int,
+        default=0,
+        doc="How many requests one network address may make in one window, whatever they carry, before getting a "
+        "429 'too many requests' answer BEFORE ARC looks up who is signed in. It stops one address from costing "
+        "a database query per request with made-up cookies. `0` (the default) means ten times "
+        "`gateway_rate_limit_requests`. Counted per web server process. Networks listed in "
+        "`gateway_rate_limit_exempt` are not counted; list an office that sends a lot of traffic through one "
+        "public address there, or raise this number.",
+    )
+    kernel.settings.declare(
         RATE_LIMIT_EXEMPT_KEY,
         doc="Networks that are not counted by the request limit while their visitors are not signed in: a "
         "comma-separated list of addresses or ranges such as `203.0.113.0/24,10.1.2.3`. Useful for an office "
@@ -1777,6 +1809,7 @@ def register(kernel: Any) -> None:
         rate_limit_requests=kernel.settings.get(RATE_LIMIT_REQUESTS_KEY),
         rate_limit_window_seconds=kernel.settings.get(RATE_LIMIT_WINDOW_SECONDS_KEY),
         rate_limit_exempt=exempt_networks,
+        rate_limit_flood_requests=kernel.settings.get(RATE_LIMIT_FLOOD_REQUESTS_KEY),
         access_log=kernel.settings.get(ACCESS_LOG_KEY),
     )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=["authn", "redix"])

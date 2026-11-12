@@ -42,6 +42,8 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, Awaitable, Callable
 
+from arc.expiring import Pruner
+
 from .request import cookies_from_scope, get_header, headers_from_scope, send_json
 
 _logger = logging.getLogger("gateway")
@@ -741,16 +743,15 @@ class LocalRateLimiter:
     def __init__(self) -> None:
         self._counts: dict[str, tuple[int, float]] = {}
         self._lock = asyncio.Lock()
+        # Keys are visitor-chosen, so the table must stay bounded; the stale ones are dropped on a timer
+        # (arc.expiring), not on every request: above 4096 keys the per-request rebuild cost 486 us at
+        # 5,000 keys and 2,480 us at 50,000, on the event loop, exactly while Redis was away.
+        self._pruner = Pruner(threshold=_FALLBACK_PRUNE_THRESHOLD)
 
     async def allow(self, key: str, limit: int, window_seconds: int) -> bool:
         async with self._lock:
             now = time.monotonic()
-            if len(self._counts) > _FALLBACK_PRUNE_THRESHOLD:
-                self._counts = {
-                    k: (c, start)
-                    for k, (c, start) in self._counts.items()
-                    if now - start < window_seconds
-                }
+            self._pruner.prune(self._counts, lambda entry: now - entry[1] >= window_seconds, now)
             count, window_start = self._counts.get(key, (0, now))
             if now - window_start >= window_seconds:
                 count, window_start = 0, now
@@ -873,6 +874,58 @@ def rate_limit_exempt(identity: Any, client_ip: str | None, networks: Sequence[N
     if getattr(identity, "user_id", None):
         return False
     return in_networks(client_ip, networks)
+
+
+class RejectionCounter:
+    """How many requests the flood guard has turned away (shown at /metrics)."""
+
+    total = 0
+
+
+IP_FLOOD_REJECTIONS = RejectionCounter()
+
+
+def ip_flood_middleware(
+    *,
+    enabled: bool,
+    limit: int,
+    window_seconds: int,
+    limiter: LocalRateLimiter,
+    exempt_networks: Sequence[Network] = (),
+) -> Middleware:
+    """A coarse per-address ceiling that runs BEFORE identity is resolved.
+
+    The per-visitor limit (rate_limit_middleware) is keyed by the resolved identity, so identity has to be
+    resolved first: a request with a made-up session cookie cost a Redis read and a database query before
+    any limit saw it. This counts requests per client address in this process (no Redis call, a few
+    microseconds) and answers 429 once an address passes `limit`, a high ceiling (by default ten times the
+    per-visitor limit), so one address flooding cannot spend a lookup per request. The per-visitor limit
+    stays exactly where it was. Each web worker counts for itself. Networks in the exempt list are not
+    counted (an office behind one public address).
+
+    Placed right after client_ip_middleware, ahead of identity_middleware; only HTTP requests are counted."""
+
+    def middleware(app: ASGIApp) -> ASGIApp:
+        async def wrapped(scope, receive, send):
+            if not enabled or scope["type"] != "http":
+                return await app(scope, receive, send)
+            client_ip = scope.get("state", {}).get("arc_client_ip")
+            if not client_ip or in_networks(client_ip, exempt_networks):
+                return await app(scope, receive, send)
+            if not await limiter.allow(f"flood:{client_ip}", limit, window_seconds):
+                IP_FLOOD_REJECTIONS.total += 1
+                await send_json(
+                    send,
+                    429,
+                    {"error": "rate limit exceeded", "code": "rate_limited"},
+                    extra_headers={"Retry-After": str(window_seconds)},
+                )
+                return
+            await app(scope, receive, send)
+
+        return wrapped
+
+    return middleware
 
 
 def rate_limit_middleware(
