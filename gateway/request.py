@@ -16,6 +16,8 @@ no longer needs msgspec as its own dependency at all.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs
@@ -30,6 +32,78 @@ class HTTPError(Exception):
         self.status_code = status_code
         self.detail = detail if detail is not None else {"error": _phrase(status_code)}
         super().__init__(f"HTTP {status_code}: {self.detail}")
+
+
+class ClientDisconnected(Exception):
+    """The client closed the connection before the whole request body had arrived. Nobody is left to answer:
+    the gateway ends the request quietly instead of sending an error to a connection that is gone."""
+
+
+class BodyStream:
+    """The body of a route registered with `stream_body=True`, handed to the handler UNREAD.
+
+    The gateway normally reads a whole body into memory before the handler runs (bounded by the body budget).
+    That is right for JSON and wrong for a file upload: a 1 GB upload cannot be a 1 GB `bytes`. A streaming
+    route gets this instead, and reads the pieces as they arrive (`chunks()`), so the handler decides where
+    they go (a file on disk, a hash, a scanner) and memory stays at one piece per request.
+
+    What it enforces, because a handler that streams could easily forget:
+
+      * `max_bytes` - the route's own ceiling. Going over raises HTTPError 413 on the chunk that crosses it,
+        not after the whole body has been taken.
+      * `idle_timeout` - seconds the client may go without sending a byte before the request is given up
+        (HTTPError 408). A slow-loris upload would otherwise hold a worker connection forever.
+      * a client that goes away raises `ClientDisconnected`.
+
+    The caller authorized the request before the first byte was read (see `add_route`'s `authorize`)."""
+
+    def __init__(self, receive, *, max_bytes: int | None, idle_timeout: float | None = None) -> None:
+        self._receive = receive
+        self.max_bytes = max_bytes
+        self.idle_timeout = idle_timeout or None
+        self.received = 0
+        self.finished = False
+
+    async def _next_message(self) -> dict:
+        if self.idle_timeout is None:
+            return await self._receive()
+        try:
+            return await asyncio.wait_for(self._receive(), self.idle_timeout)
+        except TimeoutError:
+            raise HTTPError(408, {"error": "the upload stalled", "idle_timeout_seconds": self.idle_timeout}) from None
+
+    async def chunks(self) -> AsyncIterator[bytes]:
+        """Each piece of the body as it arrives, until the last one. Raises HTTPError (413 over the ceiling,
+        408 when idle) or ClientDisconnected."""
+        while not self.finished:
+            message = await self._next_message()
+            if message.get("type") != "http.request":
+                self.finished = True
+                raise ClientDisconnected()
+            chunk = message.get("body", b"")
+            self.received += len(chunk)
+            if self.max_bytes is not None and self.received > self.max_bytes:
+                self.finished = True  # the rest is drained by the gateway after the reply
+                raise HTTPError(413, {"error": "payload too large", "limit_bytes": self.max_bytes})
+            if not message.get("more_body", False):
+                self.finished = True
+            if chunk:
+                yield chunk
+
+    async def read_all(self, *, max_bytes: int | None = None) -> bytes:
+        """The whole body in memory, for a handler that wants the old behaviour (a kill switch for streaming).
+        `max_bytes` (never above the route's own ceiling) bounds it."""
+        limits = [value for value in (max_bytes, self.max_bytes) if value is not None]
+        limit = min(limits) if limits else None
+        parts: list[bytes] = []
+        total = 0
+        async for chunk in self.chunks():
+            total += len(chunk)
+            if limit is not None and total > limit:
+                self.finished = True
+                raise HTTPError(413, {"error": "payload too large", "limit_bytes": limit})
+            parts.append(chunk)
+        return b"".join(parts)
 
 
 @dataclass
@@ -113,6 +187,55 @@ class StreamResponse:
     media_type: str = "application/x-ndjson"
 
 
+@dataclass
+class FileResponse:
+    """Return one of these to send a file from disk as the response, without the worker moving its bytes.
+
+    Sending a big file as a series of `bytes` chunks (`StreamResponse`) does not slow down for a slow client: the
+    server queues every chunk as fast as the disk can produce it, so a 1 GiB download to a client reading at
+    100 MB/s sat in the worker as ~1 GiB of memory (measured: +962 MB with the client having read 400 MB). With
+    the ASGI `http.response.pathsend` extension the SERVER reads the file and writes it to the socket at the pace
+    the client takes it (+1 MB in the same test). A server without the extension gets the file in chunks instead.
+
+    `headers` are added to Content-Type and Content-Length (the file's size). The path must already be one the
+    caller is allowed to serve: nothing is checked here."""
+
+    path: Any
+    status_code: int = 200
+    headers: dict[str, str] = field(default_factory=dict)
+    media_type: str = "application/octet-stream"
+
+
+_FILE_CHUNK_BYTES = 256 * 1024
+
+
+async def send_file(send, response: FileResponse, scope: dict) -> None:
+    """Sends `response.path`: `http.response.start`, then either `http.response.pathsend` (the server streams the
+    file itself) or, on a server without it, the file in chunks. Raises FileNotFoundError BEFORE anything is sent,
+    so the caller can still answer 404."""
+    import os
+
+    path = os.fspath(response.path)
+    size = (await asyncio.to_thread(os.stat, path)).st_size
+    headers = [(b"content-type", response.media_type.encode("latin-1")), (b"content-length", str(size).encode())]
+    for k, v in (response.headers or {}).items():
+        headers.append((k.encode("latin-1"), v.encode("latin-1")))
+    await send({"type": "http.response.start", "status": response.status_code, "headers": headers})
+    if "http.response.pathsend" in (scope.get("extensions") or {}):
+        await send({"type": "http.response.pathsend", "path": path})
+        return
+    handle = await asyncio.to_thread(open, path, "rb")
+    try:
+        while True:
+            chunk = await asyncio.to_thread(handle.read, _FILE_CHUNK_BYTES)
+            if not chunk:
+                break
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+    finally:
+        await asyncio.to_thread(handle.close)
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
 async def send_stream(send, response: "StreamResponse") -> None:
     """Sends `http.response.start` once, then one `http.response.body`
     message per item `response.source` yields (more_body=True throughout),
@@ -158,6 +281,9 @@ class Request:
     # response header and carried into relay's own
     # CallContext (so a background job this request
     # enqueues can be traced back to it)
+    stream: BodyStream | None = None  # set (and `body` left empty) on a route registered with
+    # `stream_body=True`: the body, unread, to be consumed
+    # piece by piece (see BodyStream)
 
     def json(self, schema: Any | None = None) -> Any:
         """The body decoded as JSON (and validated against `schema` when given). Raises HTTPError 413
@@ -176,6 +302,11 @@ class Request:
         multipart.py itself imports HTTPError from here."""
         from .multipart import parse_multipart_form
 
+        if self.stream is not None:
+            raise RuntimeError(
+                "this route streams its body (stream_body=True), so there is no `body` to parse: read it with "
+                "gateway.multipart_stream.read_multipart_stream(request, ...)"
+            )
         return parse_multipart_form(self.body, self.headers.get("content-type", ""))
 
     def query(self, name: str, default: str | None = None) -> str | None:

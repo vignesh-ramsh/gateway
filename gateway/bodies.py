@@ -58,6 +58,19 @@ def body_size_hint(scope: dict, *, ceiling: int) -> int:
     return ceiling if chunked else 0
 
 
+def declared_body_length(scope: dict) -> int | None:
+    """The Content-Length the client declared, or None when there is none (chunked, no body) or it is not a
+    usable number. For a streamed body, where the length is a cheap early refusal, never a promise."""
+    for name, value in scope.get("headers", ()):
+        if name.lower() == b"content-length":
+            try:
+                declared = int(value)
+            except ValueError:
+                return None
+            return declared if declared >= 0 else None
+    return None
+
+
 class BodyBudgetBusy(Exception):
     """No room in the budget within the wait. Says of itself that it is capacity, not a bug
     (`http_status`, `retry_after`): the gateway answers 503 with Retry-After, like a full database pool."""

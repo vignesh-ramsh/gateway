@@ -7,6 +7,9 @@ dependencies = [
     "granian>=1.0",
     "typer>=0.12",
     "rich>=13.0",
+    # The streaming multipart parser (gateway/multipart_stream.py): an upload is parsed as it arrives and
+    # written to disk, never held in memory whole. The same library Starlette and FastAPI use.
+    "python-multipart>=0.0.20",
 ]
 # msgspec deliberately NOT listed here anymore — gateway used to call it
 # directly (request.py/openapi.py), now goes through arc.codec instead, so

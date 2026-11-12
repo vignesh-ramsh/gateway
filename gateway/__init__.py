@@ -41,7 +41,14 @@ from arc.settings import SettingsError
 
 from . import bodies as _bodies
 from . import middleware as _middleware
-from .bodies import EARLY_AUTH_BODY_BYTES, BodyBudget, BodyBudgetBusy, body_size_hint, serve_and_drain
+from .bodies import (
+    EARLY_AUTH_BODY_BYTES,
+    BodyBudget,
+    BodyBudgetBusy,
+    body_size_hint,
+    declared_body_length,
+    serve_and_drain,
+)
 from .middleware import (
     DEFAULT_ACCESS_LOG_MODE,
     LocalRateLimiter,
@@ -70,7 +77,10 @@ from .health import HEALTH_PATHS, ReadinessProbe
 from .health import serve as serve_health
 from .openapi import build_openapi_spec, render_openapi_css, render_openapi_html
 from .request import (
+    BodyStream,
+    ClientDisconnected,
     EncodedJSON,
+    FileResponse,
     HTTPError,
     Request,
     Response,
@@ -82,6 +92,7 @@ from .request import (
     query_params_from_scope,
     read_body,
     send_bytes,
+    send_file,
     send_json,
     send_json_with_etag,
     send_stream,
@@ -138,6 +149,13 @@ DEFAULT_MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
 #: 0 = no bound.
 MAX_INFLIGHT_BODY_BYTES_KEY = "gateway_max_inflight_body_bytes"
 DEFAULT_MAX_INFLIGHT_BODY_BYTES = 256 * 1024 * 1024
+
+#: How long a client may go without sending a byte of a STREAMED request body (a route registered with
+#: `stream_body=True`, such as a file upload) before the request is given up with a 408. Such a body is not
+#: held in memory, but a stalled client still holds a connection. Read on every streamed request, so a change
+#: applies at once. 0 = never.
+BODY_IDLE_TIMEOUT_KEY = "gateway_body_idle_timeout_seconds"
+DEFAULT_BODY_IDLE_TIMEOUT_SECONDS = 30
 
 ACCESS_LOG_KEY = "gateway_access_log"
 
@@ -450,6 +468,7 @@ class GatewayProvider:
         plugin: str | None = None,
         roles: frozenset[str] | None = None,
         authorize: Callable[[Any], None] | None = None,
+        stream_body: bool = False,
     ) -> None:
         """Register a route. Relay (Phase 3) will call this the same way any
         other caller does — Gateway never hardcodes knowledge of Resources.
@@ -519,7 +538,13 @@ class GatewayProvider:
         empty and raising HTTPError to refuse. The gateway runs it before it reads a large request body
         (a declared 64 KB or more, or no declared length), so a caller who would be refused anyway does
         not get a worker to hold their upload in memory first. The route's handler must still do its
-        own check: this one is early, not instead."""
+        own check: this one is early, not instead.
+
+        `stream_body`: True for a route that takes a big body it should not hold in memory (a file upload).
+        The gateway then does not read the body at all: the handler gets `request.stream` (a BodyStream, with
+        `request.body` empty) and reads the pieces as they arrive. Such a route is ALWAYS authorized
+        (`authorize`) before the first byte is read, takes nothing from the in-memory body budget, and has its
+        `max_body_bytes` and the `gateway_body_idle_timeout_seconds` enforced as the body streams."""
         first_segment = next((s for s in path.strip("/").split("/") if s), None)
         if first_segment is not None and first_segment in self._spa_mounts:
             raise RouterError(
@@ -540,6 +565,7 @@ class GatewayProvider:
             plugin=plugin,
             roles=roles,
             authorize=authorize,
+            stream_body=stream_body,
         )
         self._built_app = None
 
@@ -806,6 +832,7 @@ class GatewayProvider:
                     "method": route.method,
                     "path": route.path,
                     "max_body_bytes": route.max_body_bytes,
+                    "stream_body": route.stream_body,
                     "websocket": route.method == WEBSOCKET_METHOD,
                 }
                 for route in self._router.all_routes()
@@ -1047,14 +1074,31 @@ class GatewayProvider:
                 json_limit=self._max_json_body_bytes,
             )
 
+        stream: BodyStream | None = None
         try:
-            hint = body_size_hint(scope, ceiling=ceiling)
-            if route.authorize is not None and hint >= EARLY_AUTH_BODY_BYTES:
-                # A caller who would be refused anyway is refused before a worker holds their upload in memory.
-                route.authorize(build_request(b""))
-            # Counted against what this worker may hold at once; waits briefly for room, then 503.
-            reservation[0] = await self._body_budget.reserve(hint)
-            body = await read_body(receive, max_bytes=ceiling)
+            if route.stream_body:
+                # The body is NOT read here: the handler consumes it as it arrives. So the caller is always
+                # authorized first (whatever the size), a declared length over the ceiling is refused before a
+                # byte is read, and nothing is taken from the in-memory body budget - the body is never held.
+                if route.authorize is not None:
+                    route.authorize(build_request(b""))
+                declared = declared_body_length(scope)
+                if declared is not None and declared > ceiling:
+                    raise HTTPError(413, {"error": "payload too large", "limit_bytes": ceiling})
+                stream = BodyStream(
+                    receive,
+                    max_bytes=ceiling,
+                    idle_timeout=self._kernel.settings.get(BODY_IDLE_TIMEOUT_KEY),
+                )
+                body = b""
+            else:
+                hint = body_size_hint(scope, ceiling=ceiling)
+                if route.authorize is not None and hint >= EARLY_AUTH_BODY_BYTES:
+                    # A caller who would be refused anyway is refused before a worker holds their upload in memory.
+                    route.authorize(build_request(b""))
+                # Counted against what this worker may hold at once; waits briefly for room, then 503.
+                reservation[0] = await self._body_budget.reserve(hint)
+                body = await read_body(receive, max_bytes=ceiling)
         except HTTPError as exc:
             await send_error(send, scope, exc.status_code, exc.detail)
             return
@@ -1066,8 +1110,9 @@ class GatewayProvider:
             return
 
         request = build_request(body)
+        request.stream = stream
 
-        if route.request_schema is not None and route.validate_body:
+        if route.request_schema is not None and route.validate_body and stream is None:
             try:
                 request.validated = request.json(route.request_schema)
             except HTTPError as exc:
@@ -1082,11 +1127,24 @@ class GatewayProvider:
         except HTTPError as exc:
             await send_error(send, scope, exc.status_code, exc.detail)
             return
+        except ClientDisconnected:
+            # The client went away in the middle of its upload: there is nobody to answer, and it is not a
+            # fault worth an error report. The handler has already cleaned up after itself.
+            _logger.info("client disconnected during %s %s", method, path)
+            return
         except Exception as exc:
             if getattr(exc, "http_status", None) == 503:
                 await self._send_unavailable(send, exc, method, path)
             else:
                 await self._send_unhandled_exception(send, scope, exc, method, path, route.path)
+            return
+
+        if isinstance(result, FileResponse):
+            try:
+                await send_file(send, result, scope)
+            except FileNotFoundError:
+                # raised before anything was sent: the file is gone from disk, so this is an ordinary 404
+                await send_error(send, scope, 404, {"error": "not found"})
             return
 
         if isinstance(result, StreamResponse):
@@ -1662,6 +1720,14 @@ def register(kernel: Any) -> None:
         "256 MiB; 0 means no limit). A body is read in full before it is handled, so many big uploads at once "
         "use a lot of memory. A request that does not fit waits up to 5 seconds, then gets a 503 with a 'try "
         "again' hint. Restart to apply.",
+    )
+    kernel.settings.declare(
+        BODY_IDLE_TIMEOUT_KEY,
+        type=int,
+        default=DEFAULT_BODY_IDLE_TIMEOUT_SECONDS,
+        doc="How many seconds a client may go without sending any data of a streamed upload (such as a file upload) "
+        "before the upload is given up with a 408 answer (default 30; 0 means never). It stops a stalled or "
+        "deliberately slow client from holding a connection open. Takes effect for the next upload.",
     )
     kernel.settings.declare(
         ACCESS_LOG_KEY,

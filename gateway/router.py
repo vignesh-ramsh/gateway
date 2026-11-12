@@ -127,6 +127,10 @@ class RouteEntry:
     # called with a Request (its body empty) and raises HTTPError to refuse. Relay passes the role check
     # it runs again inside `handler`; None (a route registered by anyone else) means no early check.
     authorize: Callable[[Any], None] | None = None
+    # True: the gateway does NOT read this route's body. The handler gets `request.stream` (a BodyStream) and
+    # consumes the pieces as they arrive, so a big upload is never held in memory whole. The route is always
+    # authorized (`authorize`) before the first byte is read, and `max_body_bytes` is enforced as it streams.
+    stream_body: bool = False
 
 
 @dataclass
@@ -204,6 +208,7 @@ class Router:
         plugin: str | None = None,
         roles: frozenset[str] | None = None,
         authorize: Callable[[Any], None] | None = None,
+        stream_body: bool = False,
     ) -> None:
         method = method.upper()
         node = self._ensure_node(path)
@@ -223,6 +228,7 @@ class Router:
             plugin=plugin,
             roles=roles,
             authorize=authorize,
+            stream_body=stream_body,
         )
         self.generation += 1
 
