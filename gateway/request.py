@@ -260,6 +260,14 @@ async def send_stream(send, response: "StreamResponse") -> None:
     await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
+def is_json_media_type(content_type: str | None) -> bool:
+    """Is this Content-Type header JSON: `application/json` or a `+json` type (`application/vnd.api+json`), with
+    or without parameters (`; charset=utf-8`), in any letter case? Anything else - `text/plain`,
+    `application/x-www-form-urlencoded`, nothing at all - is not."""
+    media = (content_type or "").split(";", 1)[0].strip().lower()
+    return media == "application/json" or (media.startswith("application/") and media.endswith("+json"))
+
+
 @dataclass
 class Request:
     method: str
@@ -288,7 +296,22 @@ class Request:
     def json(self, schema: Any | None = None) -> Any:
         """The body decoded as JSON (and validated against `schema` when given). Raises HTTPError 413
         for a body over `json_limit`, without decoding it: decoding runs on the event loop and holds
-        the GIL, so its cost is every other request's wait. Raises arc.codec.CodecError for bad JSON."""
+        the GIL, so its cost is every other request's wait. Raises arc.codec.CodecError for bad JSON.
+
+        Raises HTTPError 415 when there is a body and the request does not say it is JSON (`Content-Type:
+        application/json`). A browser can send a cross-site form (`<form enctype="text/plain">`) whose body is valid
+        JSON without any CORS preflight; refusing every body that does not declare itself as JSON means such a page
+        can neither log someone in (login CSRF) nor reach any other endpoint through its body. Every client ARC
+        ships already sends the header."""
+        if self.body and not is_json_media_type(self.headers.get("content-type")):
+            raise HTTPError(
+                415,
+                {
+                    "error": "unsupported media type",
+                    "code": "unsupported_media_type",
+                    "detail": "send the request body as JSON with the header 'Content-Type: application/json'",
+                },
+            )
         if self.json_limit is not None and len(self.body) > self.json_limit:
             raise HTTPError(413, {"error": "JSON body too large", "limit_bytes": self.json_limit})
         if schema is not None:
@@ -395,6 +418,7 @@ _PHRASES = {
     404: "Not Found",
     405: "Method Not Allowed",
     413: "Payload Too Large",
+    415: "Unsupported Media Type",
     422: "Unprocessable Entity",
     429: "Too Many Requests",
     500: "Internal Server Error",
