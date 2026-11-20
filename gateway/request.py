@@ -246,18 +246,23 @@ async def send_stream(send, response: "StreamResponse") -> None:
     (gateway._dispatch) is expected to log it and let the stream simply end
     (a truncated stream is itself the client-visible signal something went
     wrong, the same way a truncated file download is)."""
-    headers = [(b"content-type", response.media_type.encode("latin-1"))]
-    for k, v in (response.headers or {}).items():
-        headers.append((k.encode("latin-1"), v.encode("latin-1")))
-    await send({"type": "http.response.start", "status": response.status_code, "headers": headers})
-    # ndjson (the default): each chunk is a JSON-able value, framed with a
-    # trailing newline. Anything else: chunks already ARE the raw bytes to
-    # send — no framing, no encoding, exactly what a binary stream needs.
-    raw = response.media_type != "application/x-ndjson"
-    async for chunk in response.source:
-        body = chunk if raw else (encode_json(chunk) + b"\n")
-        await send({"type": "http.response.body", "body": body, "more_body": True})
-    await send({"type": "http.response.body", "body": b"", "more_body": False})
+    try:
+        headers = [(b"content-type", response.media_type.encode("latin-1"))]
+        for k, v in (response.headers or {}).items():
+            headers.append((k.encode("latin-1"), v.encode("latin-1")))
+        await send({"type": "http.response.start", "status": response.status_code, "headers": headers})
+        # ndjson chunks are encoded; binary streams are forwarded unchanged.
+        raw = response.media_type != "application/x-ndjson"
+        async for chunk in response.source:
+            body = chunk if raw else (encode_json(chunk) + b"\n")
+            await send({"type": "http.response.body", "body": body, "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+    finally:
+        # File serving may have opened its upstream before returning this
+        # response. Release it even if headers fail or the client disconnects.
+        close = getattr(response.source, "aclose", None)
+        if close is not None:
+            await close()
 
 
 def is_json_media_type(content_type: str | None) -> bool:
